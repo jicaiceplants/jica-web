@@ -11,6 +11,8 @@ export interface UserAccount {
   assignedTruckId?: string;
   photoUrl?: string;
   active: boolean;
+  activeSessionToken?: string | null;
+  lastActiveAt?: string | null;
   createdAt: string;
   lastLogin?: string;
 }
@@ -19,8 +21,8 @@ export interface IceProduct {
   id: string;
   name: string;
   category: "Tube" | "Block" | "Crushed";
-  sackSize: string; // "50kg Big Sack", "25kg Small Sack", "Standard Block"
-  price: number; // in PHP
+  sackSize: string;
+  price: number; // in PHP (>= 0 allowed)
   inStock: number;
   imageUrl?: string;
 }
@@ -47,7 +49,7 @@ export interface StoreCustomer {
   defaultSackSize: string;
   defaultQty: number;
   defaultPaymentType: "Cash" | "Charge Invoice";
-  isInstitutional: boolean; // true for hospitals, universities, major supermarkets
+  isInstitutional: boolean;
 }
 
 export interface LoadSlipItem {
@@ -61,26 +63,45 @@ export interface LoadSlipItem {
   sackSize: string;
   plannedQty: number;
   deliveredQty: number;
+  returnedQty?: number;
   unitPrice: number;
-  totalPrice: number; // deliveredQty * unitPrice or plannedQty * unitPrice
+  totalPrice: number;
   paymentType: "Cash" | "Charge Invoice";
   status: "Pending" | "In Transit" | "Completed" | "Partial" | "Cancelled";
   partialReason?: string;
   deliveredAt?: string;
 }
 
+export type LoadSlipStatus =
+  | "DISPATCHED"
+  | "ACTIVE"
+  | "IN_TRANSIT"
+  | "DELIVERY_FINISHED"
+  | "AWAITING_REMIT"
+  | "REMITTED"
+  | "COMPLETED"
+  | "CANCELLED"
+  | "Pending"
+  | "In-Transit"
+  | "Completed"
+  | "Completed / Pending Remittance"
+  | "Reconciled"
+  | "Draft"
+  | "Active";
+
 export interface LoadSlip {
-  id: string; // e.g. "LS-20261123-01"
+  id: string; // DB UUID when synced or slip number
+  slipNumber?: string; // e.g. "LS-20261125-TRK01-A1B2"
   idempotencyKey: string;
-  date: string; // YYYY-MM-DD
-  time: string; // HH:MM
+  date: string; // YYYY-MM-DD Asia/Manila
+  time: string; // HH:MM Asia/Manila
   truckId: string;
   truckPlate: string;
   inChargeId: string;
   inChargeName: string;
   driverId: string;
   driverName: string;
-  status: "Draft" | "Active" | "Completed" | "Completed / Pending Remittance" | "Reconciled";
+  status: LoadSlipStatus;
   items: LoadSlipItem[];
   totalLoadedSacks: number;
   totalDeliveredSacks: number;
@@ -89,6 +110,10 @@ export interface LoadSlip {
   totalCashRevenue: number;
   totalChargeRevenue: number;
   notes?: string;
+  dispatchedAt?: string;
+  deliveryFinishedAt?: string;
+  remittedAt?: string;
+  remittedBy?: string;
   createdAt: string;
   updatedAt: string;
 }
@@ -98,29 +123,48 @@ export interface TruckVehicle {
   plateNumber: string;
   model: string;
   capacitySacks: number;
+  sackCapacity?: number;
   currentDriverId?: string;
   imageUrl?: string;
   status: "Available" | "On Delivery" | "Maintenance" | "Alert";
+}
+
+export interface TruckCapacityInfo {
+  truckId: string;
+  plateNumber: string;
+  model: string;
+  sackCapacity: number;
+  usedSacks: number;
+  remainingCapacity: number;
+  activeSlipsCount: number;
+  isInTransit: boolean;
 }
 
 export interface InvoiceRecord {
   id: string;
   invoiceNumber: string;
   loadSlipId: string;
+  slipNumber?: string;
+  truckId?: string;
+  truckPlate: string;
+  driverId?: string;
+  driverName: string;
+  inChargeName?: string;
   date: string; // YYYY-MM-DD Asia/Manila
+  issuedAt?: string;
   customerName: string;
   locationName: string;
   iceType: string;
   sackSize: string;
+  plannedQty?: number;
   deliveredQty: number;
+  returnedQty?: number;
   unitPrice: number;
   totalAmount: number;
   paymentType: "Cash" | "Charge Invoice";
-  status: "Cash Paid" | "Unpaid Charge" | "Settled Charge";
+  status: "Pending Delivery" | "Cash Paid" | "Unpaid Charge" | "Settled Charge";
   settledAt?: string;
   settledBy?: string;
-  driverName: string;
-  truckPlate: string;
 }
 
 export interface LiveTruckTelemetry {

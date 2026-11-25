@@ -14,8 +14,36 @@
   --font-mono: var(--font-geist-mono);
 }
 
+html,
 body {
   background: var(--background);
   color: var(--foreground);
   font-family: Arial, Helvetica, sans-serif;
+  -webkit-tap-highlight-color: transparent;
+}
+
+.scroll-touch {
+  -webkit-overflow-scrolling: touch;
+}
+
+/* Official Print Stylesheet for Receipts & Invoices */
+@media print {
+  body * {
+    visibility: hidden;
+  }
+  .jica-print-sheet,
+  .jica-print-sheet * {
+    visibility: visible;
+  }
+  .jica-print-sheet {
+    position: absolute;
+    left: 0;
+    top: 0;
+    width: 100%;
+    background: #ffffff !important;
+    color: #000000 !important;
+    padding: 16px !important;
+    box-shadow: none !important;
+    border: none !important;
+  }
 }

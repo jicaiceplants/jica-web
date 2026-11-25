@@ -1,241 +1,240 @@
 "use client";
 
-import { useEffect, useRef, useState } from "react";
-import { MapPin, Compass } from "lucide-react";
+import React, { useEffect, useRef, useState, useMemo } from "react";
+import { loadGoogleMaps, BASE_GOOGLE_MAP_OPTIONS } from "@/lib/googleMapsLoader";
+import { CDO_MAP_CENTER } from "@/lib/constants";
+import { MapPin, LocateFixed } from "lucide-react";
 
 interface GoogleMapPickerProps {
   lat: number;
   lng: number;
   zoom?: number;
-  onPinChange: (lat: number, lng: number, address?: string) => void;
-  onGoogleReady?: () => void;
+  onPinChange: (newLat: number, newLng: number, reverseGeocodedAddress?: string) => void;
 }
 
-declare global {
-  interface Window {
-    google?: any;
-  }
-}
+const GOOGLE_MAPS_API_KEY = process.env.NEXT_PUBLIC_GOOGLE_MAPS_API_KEY || "";
 
-export default function GoogleMapPicker({ 
-  lat, 
-  lng, 
-  zoom = 13,
-  onPinChange,
-  onGoogleReady
+export function GoogleMapPicker({
+  lat,
+  lng,
+  zoom = 14,
+  onPinChange
 }: GoogleMapPickerProps) {
-  const containerRef = useRef<HTMLDivElement>(null);
+  const mapContainerRef = useRef<HTMLDivElement>(null);
   const mapInstanceRef = useRef<any>(null);
-  const markerInstanceRef = useRef<any>(null);
+  const markerRef = useRef<any>(null);
   const geocoderRef = useRef<any>(null);
-  const [hasGoogleMaps, setHasGoogleMaps] = useState(false);
-  const [currentCoord, setCurrentCoord] = useState({ lat, lng });
+  const onPinChangeRef = useRef(onPinChange);
+  const isProgrammaticMoveRef = useRef(false);
+  const isMapDraggedRef = useRef(false);
+  const lastEmittedRef = useRef<{ lat: number; lng: number }>({ lat, lng });
 
-  // Update marker & pan map when coordinates change (e.g. from Autocomplete search selection)
-  useEffect(() => {
-    setCurrentCoord({ lat, lng });
-    if (markerInstanceRef.current && mapInstanceRef.current) {
-      const pos = { lat, lng };
-      markerInstanceRef.current.setPosition(pos);
-      mapInstanceRef.current.panTo(pos);
-      if (zoom && zoom !== 13) {
-        mapInstanceRef.current.setZoom(zoom);
-      }
-    }
-  }, [lat, lng, zoom]);
+  const [isLoaded, setIsLoaded] = useState(false);
+  const [mapError, setMapError] = useState<string | null>(null);
+  const [displayCoord, setDisplayCoord] = useState({ lat, lng });
 
   useEffect(() => {
-    const apiKey = process.env.NEXT_PUBLIC_GOOGLE_MAPS_API_KEY;
+    onPinChangeRef.current = onPinChange;
+  }, [onPinChange]);
 
-    if (apiKey && apiKey !== "your_google_maps_api_key_here") {
-      setHasGoogleMaps(true);
+  const memoizedMapOptions = useMemo(
+    () => ({
+      ...BASE_GOOGLE_MAP_OPTIONS,
+      center: {
+        lat: Number.isFinite(lat) ? lat : CDO_MAP_CENTER.lat,
+        lng: Number.isFinite(lng) ? lng : CDO_MAP_CENTER.lng
+      },
+      zoom
+    }),
+    // Only capture initial camera options; external movements use panTo cleanly without recreating map
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+    []
+  );
 
-      if (typeof window !== "undefined") {
-        if (window.google?.maps?.places) {
-          initMap();
-          if (onGoogleReady) onGoogleReady();
-        } else {
-          const existingScript = document.getElementById("google-maps-script") as HTMLScriptElement;
-          if (!existingScript) {
-            const script = document.createElement("script");
-            script.id = "google-maps-script";
-            script.src = `https://maps.googleapis.com/maps/api/js?key=${apiKey}&libraries=places,geometry`;
-            script.async = true;
-            script.defer = true;
-            script.onload = () => {
-              initMap();
-              if (onGoogleReady) onGoogleReady();
-            };
-            document.head.appendChild(script);
+  const emitCoordinates = (newLat: number, newLng: number) => {
+    lastEmittedRef.current = { lat: newLat, lng: newLng };
+    setDisplayCoord({ lat: newLat, lng: newLng });
+
+    if (geocoderRef.current) {
+      geocoderRef.current.geocode(
+        { location: { lat: newLat, lng: newLng } },
+        (results: any, status: string) => {
+          if (status === "OK" && results && results[0]?.formatted_address) {
+            onPinChangeRef.current(newLat, newLng, results[0].formatted_address);
           } else {
-            const handleLoad = () => {
-              initMap();
-              if (onGoogleReady) onGoogleReady();
-            };
-            existingScript.addEventListener("load", handleLoad);
-            if (window.google?.maps) {
-              handleLoad();
-            }
+            onPinChangeRef.current(newLat, newLng);
           }
         }
-      }
-    }
-  }, []);
-
-  const initMap = () => {
-    if (!containerRef.current || !window.google?.maps) return;
-
-    try {
-      const google = window.google;
-      geocoderRef.current = new google.maps.Geocoder();
-
-      // Initial center: Cagayan de Oro City (8.4772, 124.6459, zoom 13)
-      const initialCenter = { 
-        lat: currentCoord.lat || 8.4772, 
-        lng: currentCoord.lng || 124.6459 
-      };
-
-      const map = new google.maps.Map(containerRef.current, {
-        center: initialCenter,
-        zoom: zoom || 13,
-        mapTypeControl: true,
-        streetViewControl: false,
-        fullscreenControl: true,
-        zoomControl: true,
-        clickableIcons: false,
-      });
-
-      mapInstanceRef.current = map;
-
-      // Trigger resize after modal renders to ensure zero canvas collapse
-      setTimeout(() => {
-        if (mapInstanceRef.current && window.google?.maps?.event) {
-          window.google.maps.event.trigger(mapInstanceRef.current, "resize");
-          mapInstanceRef.current.setCenter(initialCenter);
-        }
-      }, 150);
-
-      setTimeout(() => {
-        if (mapInstanceRef.current && window.google?.maps?.event) {
-          window.google.maps.event.trigger(mapInstanceRef.current, "resize");
-          mapInstanceRef.current.setCenter(initialCenter);
-        }
-      }, 350);
-
-      // Standard Draggable Marker
-      const marker = new google.maps.Marker({
-        position: initialCenter,
-        map,
-        draggable: true,
-        title: "Selected Delivery Hub (Drag to fine-tune)",
-        animation: google.maps.Animation.DROP,
-        icon: {
-          path: google.maps.SymbolPath.BACKWARD_CLOSED_ARROW,
-          scale: 7,
-          fillColor: "#00875A",
-          fillOpacity: 1,
-          strokeColor: "#ffffff",
-          strokeWeight: 2.5,
-        }
-      });
-
-      markerInstanceRef.current = marker;
-
-      const handleLocationSelect = (newLat: number, newLng: number) => {
-        setCurrentCoord({ lat: newLat, lng: newLng });
-        marker.setPosition({ lat: newLat, lng: newLng });
-
-        // Real-time reverse geocoding with graceful non-blocking fallback
-        try {
-          if (geocoderRef.current) {
-            geocoderRef.current.geocode(
-              { location: { lat: newLat, lng: newLng } },
-              (results: any, status: any) => {
-                if (status === "OK" && results?.[0]?.formatted_address) {
-                  onPinChange(newLat, newLng, results[0].formatted_address);
-                } else {
-                  onPinChange(newLat, newLng);
-                }
-              }
-            );
-          } else {
-            onPinChange(newLat, newLng);
-          }
-        } catch (e) {
-          console.warn("Reverse geocode fallback:", e);
-          onPinChange(newLat, newLng);
-        }
-      };
-
-      // Click anywhere on map to reposition pin
-      map.addListener("click", (e: any) => {
-        if (e.latLng) {
-          handleLocationSelect(e.latLng.lat(), e.latLng.lng());
-        }
-      });
-
-      // Drag pin to pinpoint exact drop-off spot
-      marker.addListener("dragend", (e: any) => {
-        if (e.latLng) {
-          handleLocationSelect(e.latLng.lat(), e.latLng.lng());
-        }
-      });
-
-    } catch (err) {
-      console.error("Error initializing Google Map picker:", err);
+      );
+    } else {
+      onPinChangeRef.current(newLat, newLng);
     }
   };
 
-  // Offline interactive fallback when key not yet configured
-  const handleCanvasClick = (e: React.MouseEvent<HTMLDivElement>) => {
-    const rect = e.currentTarget.getBoundingClientRect();
-    const x = (e.clientX - rect.left) / rect.width;
-    const y = (e.clientY - rect.top) / rect.height;
+  useEffect(() => {
+    let isMounted = true;
 
-    // Map to Cagayan de Oro bounds
-    const newLat = 8.51 - y * (8.51 - 8.44);
-    const newLng = 124.62 + x * (124.72 - 124.62);
+    loadGoogleMaps(GOOGLE_MAPS_API_KEY)
+      .then((google) => {
+        if (!isMounted || !mapContainerRef.current) return;
 
-    setCurrentCoord({ lat: newLat, lng: newLng });
-    onPinChange(newLat, newLng, `Drop-off pin near (${newLat.toFixed(4)}, ${newLng.toFixed(4)}), Cagayan de Oro City`);
+        const map = new google.maps.Map(mapContainerRef.current, memoizedMapOptions);
+        mapInstanceRef.current = map;
+        geocoderRef.current = new google.maps.Geocoder();
+
+        const marker = new google.maps.Marker({
+          position: { lat, lng },
+          map,
+          draggable: true,
+          title: "Delivery Hub Location Pin"
+        });
+        markerRef.current = marker;
+
+        // Track user map dragging cleanly without reacting during intermediate frames
+        map.addListener("dragstart", () => {
+          isMapDraggedRef.current = true;
+        });
+
+        // Fire coordinate + reverse geocode ONLY when map settles (idle) after user drag
+        map.addListener("idle", () => {
+          if (isProgrammaticMoveRef.current) {
+            isProgrammaticMoveRef.current = false;
+            isMapDraggedRef.current = false;
+            return;
+          }
+          if (!isMapDraggedRef.current) return;
+          isMapDraggedRef.current = false;
+
+          const center = map.getCenter();
+          if (!center) return;
+          const newLat = Number(center.lat().toFixed(6));
+          const newLng = Number(center.lng().toFixed(6));
+          marker.setPosition({ lat: newLat, lng: newLng });
+          emitCoordinates(newLat, newLng);
+        });
+
+        // Marker dragend fires once on release — zero React state work mid-drag
+        marker.addListener("dragend", (event: any) => {
+          const pos = event?.latLng;
+          if (!pos) return;
+          const newLat = Number(pos.lat().toFixed(6));
+          const newLng = Number(pos.lng().toFixed(6));
+          isProgrammaticMoveRef.current = true;
+          map.panTo({ lat: newLat, lng: newLng });
+          emitCoordinates(newLat, newLng);
+        });
+
+        // Tap / Click anywhere on map to place pin immediately
+        map.addListener("click", (event: any) => {
+          const pos = event?.latLng;
+          if (!pos) return;
+          const newLat = Number(pos.lat().toFixed(6));
+          const newLng = Number(pos.lng().toFixed(6));
+          marker.setPosition({ lat: newLat, lng: newLng });
+          isProgrammaticMoveRef.current = true;
+          map.panTo({ lat: newLat, lng: newLng });
+          emitCoordinates(newLat, newLng);
+        });
+
+        setIsLoaded(true);
+      })
+      .catch((err) => {
+        if (!isMounted) return;
+        setMapError(err?.message || "Unable to load Google Maps Picker.");
+      });
+
+    return () => {
+      isMounted = false;
+      if (markerRef.current) {
+        markerRef.current.setMap(null);
+      }
+      if (mapInstanceRef.current && window.google?.maps?.event) {
+        window.google.maps.event.clearInstanceListeners(mapInstanceRef.current);
+      }
+    };
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [memoizedMapOptions]);
+
+  // Move marker + pan ONLY when coordinates change externally (e.g., Search result or GPS button)
+  useEffect(() => {
+    const map = mapInstanceRef.current;
+    const marker = markerRef.current;
+    if (!map || !marker || !isLoaded) return;
+
+    const deltaLat = Math.abs(lat - lastEmittedRef.current.lat);
+    const deltaLng = Math.abs(lng - lastEmittedRef.current.lng);
+    if (deltaLat < 0.00001 && deltaLng < 0.00001) {
+      return;
+    }
+
+    lastEmittedRef.current = { lat, lng };
+    setDisplayCoord({ lat, lng });
+    isProgrammaticMoveRef.current = true;
+    marker.setPosition({ lat, lng });
+    map.panTo({ lat, lng });
+    if (zoom && map.getZoom() !== zoom) {
+      map.setZoom(zoom);
+    }
+  }, [lat, lng, zoom, isLoaded]);
+
+  const handleUseMyLocation = () => {
+    if (!navigator.geolocation) return;
+    navigator.geolocation.getCurrentPosition(
+      (pos) => {
+        const curLat = Number(pos.coords.latitude.toFixed(6));
+        const curLng = Number(pos.coords.longitude.toFixed(6));
+        const map = mapInstanceRef.current;
+        const marker = markerRef.current;
+        if (map && marker) {
+          isProgrammaticMoveRef.current = true;
+          marker.setPosition({ lat: curLat, lng: curLng });
+          map.panTo({ lat: curLat, lng: curLng });
+          map.setZoom(17);
+        }
+        emitCoordinates(curLat, curLng);
+      },
+      () => {
+        // Ignore denied geolocation gracefully
+      },
+      { enableHighAccuracy: true, timeout: 8000 }
+    );
   };
+
+  if (mapError) {
+    return (
+      <div className="h-[320px] rounded-2xl border border-slate-200 dark:border-slate-700 bg-slate-50 dark:bg-slate-900 flex flex-col items-center justify-center p-6 text-center text-xs text-slate-500 dark:text-slate-400">
+        <MapPin className="w-8 h-8 text-slate-400 mb-2" />
+        <p className="font-bold text-slate-700 dark:text-slate-200">{mapError}</p>
+        <p className="mt-1">Check NEXT_PUBLIC_GOOGLE_MAPS_API_KEY in environment configuration.</p>
+      </div>
+    );
+  }
 
   return (
-    <div 
-      style={{ width: '100%', height: '360px', minHeight: '360px' }} 
-      className="w-full relative bg-slate-900 overflow-hidden select-none rounded-2xl"
-    >
-      {hasGoogleMaps ? (
-        <div 
-          ref={containerRef} 
-          style={{ width: '100%', height: '360px', minHeight: '360px' }} 
-          className="w-full h-full" 
-        />
-      ) : (
-        <div 
-          onClick={handleCanvasClick}
-          style={{ width: '100%', height: '360px', minHeight: '360px' }}
-          className="w-full h-full relative cursor-crosshair bg-slate-950 flex flex-col justify-between p-3 overflow-hidden"
-        >
-          <div className="relative z-10 flex justify-between items-center pointer-events-none">
-            <span className="text-[10px] font-black uppercase tracking-wider text-emerald-400 bg-emerald-950/80 px-2 py-0.5 rounded-md border border-emerald-800">
-              Cagayan de Oro Delivery Grid
-            </span>
-            <span className="text-[10px] font-bold text-slate-300 bg-slate-800/80 px-2 py-0.5 rounded-md">
-              Lat: {currentCoord.lat.toFixed(4)}, Lng: {currentCoord.lng.toFixed(4)}
-            </span>
-          </div>
+    <div className="relative h-[320px] sm:h-[360px] w-full rounded-2xl overflow-hidden border border-slate-200 dark:border-slate-700 bg-slate-100 dark:bg-slate-900">
+      <div ref={mapContainerRef} className="w-full h-full" />
 
-          <div className="relative z-10 flex justify-between items-center pointer-events-none">
-            <span className="text-[10px] text-slate-400">
-              Click anywhere on map to reposition pin
-            </span>
-            <span className="text-[9px] text-emerald-500 font-bold">
-              Connecting Google Maps...
-            </span>
-          </div>
+      {!isLoaded && (
+        <div className="absolute inset-0 flex items-center justify-center bg-slate-100/80 dark:bg-slate-900/80 text-xs font-bold text-slate-500">
+          Loading Interactive Map...
         </div>
       )}
+
+      {/* Coordinates overlay pill */}
+      <div className="absolute bottom-3 left-3 bg-white/95 dark:bg-slate-900/95 backdrop-blur-xs px-3 py-1.5 rounded-xl border border-slate-200 dark:border-slate-700 shadow-sm text-[11px] font-mono text-slate-700 dark:text-slate-200 pointer-events-none">
+        {displayCoord.lat.toFixed(5)}, {displayCoord.lng.toFixed(5)}
+      </div>
+
+      {/* GPS Center Button */}
+      <button
+        type="button"
+        onClick={handleUseMyLocation}
+        className="absolute bottom-3 right-3 min-w-[44px] min-h-[44px] px-3 py-2 bg-white/95 dark:bg-slate-900/95 hover:bg-slate-50 text-[#004D40] dark:text-emerald-300 border border-slate-200 dark:border-slate-700 rounded-xl shadow-md text-xs font-bold flex items-center gap-1.5 cursor-pointer"
+        title="Center on My Current GPS Location"
+      >
+        <LocateFixed className="w-4 h-4" />
+        <span className="hidden sm:inline">Use My GPS</span>
+      </button>
     </div>
   );
 }

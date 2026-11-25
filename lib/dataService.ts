@@ -4,29 +4,21 @@ import {
   StoreCustomer,
   IceProduct,
   TruckVehicle,
+  TruckCapacityInfo,
   UserAccount,
   LoadSlip,
+  LoadSlipItem,
   LiveTruckTelemetry,
   InvoiceRecord
 } from "./types";
-import {
-  INITIAL_LOCATIONS,
-  INITIAL_CUSTOMERS,
-  INITIAL_PRODUCTS,
-  INITIAL_TRUCKS,
-  INITIAL_USERS,
-  HISTORICAL_LOAD_SLIPS,
-  YESTERDAY_LOAD_SLIP,
-  INITIAL_TELEMETRY,
-  INITIAL_INVOICES,
-  CDO_DEPOT,
-  CURRENT_USER
-} from "./mockData";
 import { supabase } from "./supabaseClient";
+import { getManilaDateString, getManilaTimeString, formatManilaDateTime } from "./dateUtils";
+import { roundCurrency, multiplyCurrency, sumCurrency } from "./currencyUtils";
 
-const BACKEND_URL = process.env.NEXT_PUBLIC_BACKEND_URL || "http://localhost:8000";
+const BACKEND_URL = (process.env.NEXT_PUBLIC_BACKEND_URL || "https://jica-backend-production.up.railway.app")
+  .replace(/\/+$/, "")
+  .trim();
 
-// Safe UUID generator
 export function generateUUID(): string {
   if (typeof crypto !== "undefined" && typeof crypto.randomUUID === "function") {
     return crypto.randomUUID();
@@ -48,7 +40,10 @@ const STORAGE_KEYS = {
   TELEMETRY: "jica_telemetry",
   CURRENT_USER: "jica_current_user",
   INVOICES: "jica_invoices",
-  RECONCILIATIONS: "jica_reconciliations"
+  RECONCILIATIONS: "jica_reconciliations",
+  WEB_SESSION: "jica_web_session",
+  AUTH_TOKEN: "jica_auth_token",
+  SESSION_TOKEN: "jica_session_token"
 };
 
 function getStorageItem<T>(key: string, defaultValue: T): T {
@@ -57,8 +52,7 @@ function getStorageItem<T>(key: string, defaultValue: T): T {
     const raw = localStorage.getItem(key);
     if (!raw) return defaultValue;
     return JSON.parse(raw) as T;
-  } catch (e) {
-    console.error(`Error reading ${key} from storage:`, e);
+  } catch {
     return defaultValue;
   }
 }
@@ -72,229 +66,380 @@ function setStorageItem<T>(key: string, value: T): void {
   }
 }
 
+const isUUID = (val?: string | null): boolean =>
+  Boolean(val && /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i.test(val.trim()));
+
+let _sessionRevokedCallback: ((reason?: string) => void) | null = null;
+
+function mapDbSlipToWeb(s: any, usersById?: Map<string, UserAccount>, trucksById?: Map<string, TruckVehicle>): LoadSlip {
+  const trk = trucksById?.get(s.truck_id);
+  const drv = s.driver_id ? usersById?.get(s.driver_id) : undefined;
+  const inc = s.in_charge_id ? usersById?.get(s.in_charge_id) : undefined;
+  const items: LoadSlipItem[] = (s.load_slip_items || []).map((item: any) => ({
+    id: item.id,
+    customerId: item.customer_id || "",
+    storeName: item.customer_name || "",
+    locationId: item.hub_id || "",
+    locationName: item.delivery_hubs?.name || item.hub_name || "",
+    iceProductId: item.product_id || "",
+    iceType: item.product_name || "",
+    sackSize: item.sack_size || "Standard Sack",
+    plannedQty: Number(item.planned_qty || 0),
+    deliveredQty: Number(item.delivered_qty || 0),
+    returnedQty: Number(item.returned_qty || 0),
+    unitPrice: roundCurrency(item.unit_price),
+    totalPrice: roundCurrency(item.total_amount),
+    paymentType: item.payment_mode === "Charge" ? "Charge Invoice" : "Cash",
+    status: (item.status as any) || (Number(item.delivered_qty || 0) >= Number(item.planned_qty || 0) && item.delivered_at ? "Completed" : "Pending"),
+    partialReason: item.partial_reason || undefined,
+    deliveredAt: item.delivered_at || undefined
+  }));
+
+  const cashRev = roundCurrency(s.total_cash_revenue);
+  const chargeRev = roundCurrency(s.total_charge_revenue);
+
+  return {
+    id: s.id,
+    slipNumber: s.slip_number || s.id,
+    idempotencyKey: s.idempotency_key || s.id,
+    date: s.date || getManilaDateString(s.created_at),
+    time: s.departure_time ? String(s.departure_time).slice(0, 5) : "06:00",
+    truckId: s.truck_id || "",
+    truckPlate: s.truck_plate || s.trucks?.plate_number || trk?.plateNumber || s.truck_id || "",
+    inChargeId: s.in_charge_id || "",
+    inChargeName: s.in_charge_name || inc?.name || s.created_by || "",
+    driverId: s.driver_id || "",
+    driverName: s.driver_name || drv?.name || "Unassigned Driver",
+    status: (s.status as any) || "DISPATCHED",
+    items,
+    totalLoadedSacks: Number(s.total_loaded_sacks || 0),
+    totalDeliveredSacks: Number(s.total_delivered_sacks || 0),
+    totalReturnedSacks: Number(s.total_returned_sacks || 0),
+    totalRevenue: roundCurrency(cashRev + chargeRev),
+    totalCashRevenue: cashRev,
+    totalChargeRevenue: chargeRev,
+    notes: s.notes || undefined,
+    dispatchedAt: s.dispatched_at || s.created_at,
+    deliveryFinishedAt: s.delivery_finished_at || undefined,
+    remittedAt: s.remitted_at || undefined,
+    remittedBy: s.remitted_by || undefined,
+    createdAt: s.created_at || new Date().toISOString(),
+    updatedAt: s.updated_at || s.created_at || new Date().toISOString()
+  };
+}
+
+function mapDbInvoiceToWeb(inv: any): InvoiceRecord {
+  const slipMeta = inv.load_slips || {};
+  const rawStatus = String(inv.status || "Pending Delivery");
+  let mappedStatus: InvoiceRecord["status"] = "Pending Delivery";
+  if (rawStatus === "Cash Paid") mappedStatus = "Cash Paid";
+  else if (rawStatus === "Unpaid Charge") mappedStatus = "Unpaid Charge";
+  else if (rawStatus === "Settled" || rawStatus === "Settled Charge") mappedStatus = "Settled Charge";
+
+  return {
+    id: inv.id,
+    invoiceNumber: inv.invoice_number,
+    loadSlipId: inv.load_slip_id || "",
+    slipNumber: inv.slip_number || slipMeta.slip_number || "",
+    truckId: inv.truck_id || slipMeta.truck_id || "",
+    truckPlate: inv.truck_plate || slipMeta.truck_plate || inv.truck_id || slipMeta.truck_id || "",
+    driverId: inv.driver_id || "",
+    driverName: inv.driver_name || slipMeta.driver_name || "",
+    inChargeName: inv.in_charge_name || slipMeta.in_charge_name || "",
+    date: inv.issue_date || getManilaDateString(inv.created_at),
+    issuedAt: inv.issued_at || inv.created_at,
+    customerName: inv.customer_name || "",
+    locationName: inv.hub_name || "",
+    iceType: inv.product_name || "",
+    sackSize: inv.sack_size || "Standard Sack",
+    plannedQty: Number(inv.planned_qty ?? inv.delivered_qty ?? 0),
+    deliveredQty: Number(inv.delivered_qty ?? 0),
+    returnedQty: Number(inv.returned_qty ?? 0),
+    unitPrice: roundCurrency(inv.unit_price),
+    totalAmount: roundCurrency(inv.total_amount),
+    paymentType: inv.payment_type === "Charge" ? "Charge Invoice" : "Cash",
+    status: mappedStatus,
+    settledAt: inv.settled_at ? formatManilaDateTime(inv.settled_at) : undefined,
+    settledBy: inv.settled_by || undefined
+  };
+}
+
 export class DataService {
-  // --- SUPABASE CLOUD SYNCHRONIZATION ---
+  static setSessionRevokedHandler(cb: ((reason?: string) => void) | null) {
+    _sessionRevokedCallback = cb;
+  }
+
+  static getSessionToken(): string | null {
+    if (typeof window === "undefined") return null;
+    try {
+      const direct = localStorage.getItem(STORAGE_KEYS.SESSION_TOKEN);
+      if (direct) return direct;
+      const raw = localStorage.getItem(STORAGE_KEYS.WEB_SESSION);
+      if (raw) {
+        const parsed = JSON.parse(raw);
+        return parsed?.sessionToken || null;
+      }
+    } catch {
+      return null;
+    }
+    return null;
+  }
+
+  static getAuthHeaders(): Record<string, string> {
+    const headers: Record<string, string> = {
+      "Content-Type": "application/json"
+    };
+    if (typeof window === "undefined") return headers;
+
+    const sessionToken = this.getSessionToken();
+    const user = this.getCurrentUser();
+    const jwtToken = localStorage.getItem(STORAGE_KEYS.AUTH_TOKEN);
+
+    if (sessionToken) headers["X-Session-Token"] = sessionToken;
+    if (user?.id) headers["X-User-Id"] = user.id;
+    if (jwtToken) headers["Authorization"] = `Bearer ${jwtToken}`;
+    return headers;
+  }
+
+  static async authorizedFetch(url: string, options: RequestInit = {}): Promise<Response> {
+    const mergedHeaders = {
+      ...this.getAuthHeaders(),
+      ...(options.headers as Record<string, string> | undefined)
+    };
+    const res = await fetch(url, { ...options, headers: mergedHeaders });
+    if (res.status === 401) {
+      const clone = res.clone();
+      const body = await clone.json().catch(() => ({}));
+      const detail = String(body?.detail || "");
+      if (detail.includes("SESSION_REVOKED") && _sessionRevokedCallback) {
+        _sessionRevokedCallback("You have been logged out because this account was signed in on another device.");
+      }
+    }
+    return res;
+  }
+
+  static clearSession(): void {
+    if (typeof window === "undefined") return;
+    localStorage.removeItem(STORAGE_KEYS.WEB_SESSION);
+    localStorage.removeItem(STORAGE_KEYS.CURRENT_USER);
+    localStorage.removeItem(STORAGE_KEYS.AUTH_TOKEN);
+    localStorage.removeItem(STORAGE_KEYS.SESSION_TOKEN);
+  }
+
+  static getCurrentUser(): UserAccount | null {
+    if (typeof window === "undefined") return null;
+    try {
+      const rawSession = localStorage.getItem(STORAGE_KEYS.WEB_SESSION);
+      if (rawSession) {
+        const session = JSON.parse(rawSession);
+        if (session?.user) return session.user as UserAccount;
+      }
+      return getStorageItem<UserAccount | null>(STORAGE_KEYS.CURRENT_USER, null);
+    } catch {
+      return null;
+    }
+  }
+
+  static setCurrentUser(user: UserAccount | null): void {
+    if (typeof window === "undefined") return;
+    if (!user) {
+      localStorage.removeItem(STORAGE_KEYS.CURRENT_USER);
+      return;
+    }
+    setStorageItem(STORAGE_KEYS.CURRENT_USER, user);
+  }
+
+  static async validateActiveSession(): Promise<{ valid: boolean; reason?: string }> {
+    const user = this.getCurrentUser();
+    const sessionToken = this.getSessionToken();
+    if (!user?.id || !sessionToken) {
+      return { valid: false, reason: "Session expired." };
+    }
+
+    try {
+      const res = await fetch(`${BACKEND_URL}/api/v1/auth/validate-session`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ user_id: user.id, session_token: sessionToken })
+      });
+      if (res.status === 401) {
+        const err = await res.json().catch(() => ({}));
+        return {
+          valid: false,
+          reason: err.detail?.replace("SESSION_REVOKED: ", "") || "You have been logged out because this account was signed in on another device."
+        };
+      }
+      if (res.ok) return { valid: true };
+    } catch {
+      // Fallback check via Supabase directly if backend cold/unreachable
+      try {
+        const { data, error } = await supabase
+          .from("user_accounts")
+          .select("active_session_token, is_active, deleted_at")
+          .eq("id", user.id)
+          .limit(1)
+          .single();
+        if (!error && data) {
+          if (!data.is_active || data.deleted_at) {
+            return { valid: false, reason: "Your account has been deactivated." };
+          }
+          if (data.active_session_token !== sessionToken) {
+            return {
+              valid: false,
+              reason: "You have been logged out because this account was signed in on another device."
+            };
+          }
+        }
+      } catch {
+        // Offline transient check: don't spuriously kick user out on network drop
+      }
+    }
+    return { valid: true };
+  }
+
+  static async logoutUser(): Promise<void> {
+    const user = this.getCurrentUser();
+    const sessionToken = this.getSessionToken();
+    if (user?.id) {
+      try {
+        await fetch(`${BACKEND_URL}/api/v1/auth/logout`, {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ user_id: user.id, session_token: sessionToken })
+        });
+      } catch {
+        // Ignore network errors on explicit logout
+      }
+    }
+    this.clearSession();
+  }
+
+  // --- SUPABASE LIVE SYNCHRONIZATION (ZERO MOCK DATA) ---
   static async fetchLiveFromSupabase(): Promise<{ success: boolean; error?: string }> {
     try {
-      // 1. Products
-      const { data: dbProducts, error: prodErr } = await supabase
-        .from("products")
-        .select("*")
-        .eq("is_active", true)
-        .is("deleted_at", null)
-        .order("created_at", { ascending: true });
+      const [prodsRes, trucksRes, hubsRes, custsRes, usersRes, invRes, slipsRes] = await Promise.all([
+        supabase.from("products").select("*").eq("is_active", true).is("deleted_at", null).order("created_at", { ascending: true }),
+        supabase.from("trucks").select("*").eq("is_active", true).is("deleted_at", null).order("id", { ascending: true }),
+        supabase.from("delivery_hubs").select("*").eq("is_active", true).is("deleted_at", null).order("name", { ascending: true }),
+        supabase.from("customers").select("*, delivery_hubs(name)").eq("is_active", true).is("deleted_at", null),
+        supabase.from("user_accounts").select("id, full_name, role, username, email, phone_number, assigned_truck_id, photo_url, is_active, created_at").eq("is_active", true).is("deleted_at", null).order("created_at", { ascending: true }),
+        supabase.from("invoices").select("*, load_slips(slip_number, truck_id, truck_plate, driver_name, in_charge_name, status)").is("deleted_at", null).order("created_at", { ascending: false }),
+        supabase.from("load_slips").select("*, load_slip_items(*, delivery_hubs(name)), trucks(plate_number, model)").is("deleted_at", null).order("created_at", { ascending: false })
+      ]);
 
-      if (!prodErr && dbProducts) {
-        const mappedProducts: IceProduct[] = dbProducts.map(p => ({
+      let mappedProducts: IceProduct[] = [];
+      if (!prodsRes.error && prodsRes.data) {
+        mappedProducts = prodsRes.data.map(p => ({
           id: p.id,
           name: p.name,
-          category: (p.description as any) || "Tube",
-          sackSize: `${p.sack_weight_kg || 50}kg Sack`,
-          price: Number(p.standard_price) || 0,
-          inStock: 500,
+          category: ((p.category || p.description || "Tube") as any),
+          sackSize: p.sack_size || `${p.sack_weight_kg || 50}kg Sack`,
+          price: roundCurrency(p.standard_price),
+          inStock: 0,
           imageUrl: p.image_url || undefined
         }));
         setStorageItem(STORAGE_KEYS.PRODUCTS, mappedProducts);
       }
 
-      // 2. Trucks
-      const { data: dbTrucks, error: truckErr } = await supabase
-        .from("trucks")
-        .select("*")
-        .eq("is_active", true)
-        .is("deleted_at", null)
-        .order("id", { ascending: true });
-
-      if (!truckErr && dbTrucks) {
-        const mappedTrucks: TruckVehicle[] = dbTrucks.map(t => ({
-          id: t.id,
-          plateNumber: t.plate_number,
-          model: t.model,
-          capacitySacks: t.max_sack_capacity || 120,
-          imageUrl: t.image_url || undefined,
-          status: "Available"
-        }));
+      let mappedTrucks: TruckVehicle[] = [];
+      const trucksMap = new Map<string, TruckVehicle>();
+      if (!trucksRes.error && trucksRes.data) {
+        mappedTrucks = trucksRes.data.map(t => {
+          const cap = Number(t.sack_capacity ?? t.max_sack_capacity ?? 120);
+          const item: TruckVehicle = {
+            id: t.id,
+            plateNumber: t.plate_number,
+            model: t.model,
+            capacitySacks: cap,
+            sackCapacity: cap,
+            imageUrl: t.image_url || undefined,
+            status: "Available"
+          };
+          trucksMap.set(item.id, item);
+          return item;
+        });
         setStorageItem(STORAGE_KEYS.TRUCKS, mappedTrucks);
       }
 
-      // 3. Delivery Hubs
-      const { data: dbHubs, error: hubErr } = await supabase
-        .from("delivery_hubs")
-        .select("*")
-        .eq("is_active", true)
-        .is("deleted_at", null)
-        .order("name", { ascending: true });
-
-      if (!hubErr && dbHubs) {
-        const mappedLocations: DeliveryLocation[] = dbHubs.map(h => ({
+      if (!hubsRes.error && hubsRes.data) {
+        const mappedLocations: DeliveryLocation[] = hubsRes.data.map(h => ({
           id: h.id,
           name: h.name,
           address: h.address,
           latitude: Number(h.latitude),
           longitude: Number(h.longitude),
-          zone: "City Proper"
+          zone: (h.zone as any) || "City Proper"
         }));
         setStorageItem(STORAGE_KEYS.LOCATIONS, mappedLocations);
       }
 
-      // 4. Store Customers
-      const { data: dbCustomers, error: custErr } = await supabase
-        .from("customers")
-        .select("*, delivery_hubs(name)")
-        .eq("is_active", true)
-        .is("deleted_at", null);
-
-      if (!custErr && dbCustomers) {
-        const mappedCustomers: StoreCustomer[] = dbCustomers.map(c => ({
+      if (!custsRes.error && custsRes.data) {
+        const mappedCustomers: StoreCustomer[] = custsRes.data.map(c => ({
           id: c.id,
           name: c.name,
           locationId: c.hub_id,
-          locationName: c.delivery_hubs?.name || "CDO Delivery Hub",
+          locationName: c.delivery_hubs?.name || "",
           contactPerson: c.contact_person || undefined,
           phone: c.contact_phone || undefined,
-          defaultIceType: "Tube Ice",
-          defaultSackSize: "50kg Big Sack",
-          defaultQty: 10,
+          defaultIceType: mappedProducts[0]?.name || "",
+          defaultSackSize: mappedProducts[0]?.sackSize || "",
+          defaultQty: 1,
           defaultPaymentType: c.default_payment === "Charge" ? "Charge Invoice" : "Cash",
           isInstitutional: false
         }));
         setStorageItem(STORAGE_KEYS.CUSTOMERS, mappedCustomers);
       }
 
-      // 5. User Accounts
-      const { data: dbUsers, error: userErr } = await supabase
-        .from("user_accounts")
-        .select("*")
-        .eq("is_active", true)
-        .is("deleted_at", null)
-        .order("created_at", { ascending: true });
-
-      if (!userErr && dbUsers) {
-        const mappedUsers: UserAccount[] = dbUsers.map(u => ({
-          id: u.id,
-          name: u.full_name,
-          username: u.username || undefined,
-          password: u.password || undefined,
-          email: u.email || `${u.username || "user"}@jicaice.com`,
-          role: u.role as Role,
-          phone: u.phone_number || undefined,
-          assignedTruckId: u.assigned_truck_id || undefined,
-          photoUrl: u.photo_url || undefined,
-          active: u.is_active ?? true,
-          createdAt: u.created_at || new Date().toISOString()
-        }));
+      const usersMap = new Map<string, UserAccount>();
+      if (!usersRes.error && usersRes.data) {
+        const mappedUsers: UserAccount[] = usersRes.data.map(u => {
+          const acc: UserAccount = {
+            id: u.id,
+            name: u.full_name,
+            username: u.username || undefined,
+            email: u.email || "",
+            role: u.role as Role,
+            phone: u.phone_number || undefined,
+            assignedTruckId: u.assigned_truck_id || undefined,
+            photoUrl: u.photo_url || undefined,
+            active: u.is_active ?? true,
+            createdAt: u.created_at || new Date().toISOString()
+          };
+          usersMap.set(acc.id, acc);
+          return acc;
+        });
         setStorageItem(STORAGE_KEYS.USERS, mappedUsers);
       }
 
-      // 6. Invoices
-      const { data: dbInvoices, error: invErr } = await supabase
-        .from("invoices")
-        .select("*")
-        .is("deleted_at", null)
-        .order("created_at", { ascending: false });
-
-      if (!invErr && dbInvoices) {
-        const mappedInvoices: InvoiceRecord[] = dbInvoices.map(inv => ({
-          id: inv.id,
-          invoiceNumber: inv.invoice_number,
-          loadSlipId: inv.load_slip_id || "",
-          date: inv.issue_date,
-          customerName: inv.customer_name,
-          locationName: inv.hub_name,
-          iceType: inv.product_name,
-          sackSize: "Standard Sack",
-          deliveredQty: inv.delivered_qty,
-          unitPrice: Number(inv.unit_price),
-          totalAmount: Number(inv.total_amount),
-          paymentType: inv.payment_type === "Charge" ? "Charge Invoice" : "Cash",
-          status: inv.status === "Settled" ? "Settled Charge" : (inv.status as any),
-          settledAt: inv.settled_at || undefined,
-          settledBy: inv.settled_by || undefined,
-          driverName: "Assigned Driver",
-          truckPlate: "JICA Fleet"
-        }));
+      if (!invRes.error && invRes.data) {
+        const mappedInvoices = invRes.data.map(mapDbInvoiceToWeb);
         setStorageItem(STORAGE_KEYS.INVOICES, mappedInvoices);
       }
 
-      // 7. Load Slips
-      const { data: dbSlips, error: slipErr } = await supabase
-        .from("load_slips")
-        .select("*, load_slip_items(*)")
-        .is("deleted_at", null)
-        .order("created_at", { ascending: false });
-
-      if (!slipErr && dbSlips) {
-        const mappedSlips: LoadSlip[] = dbSlips.map(s => ({
-          id: s.slip_number || s.id,
-          idempotencyKey: s.idempotency_key,
-          date: s.date,
-          time: s.departure_time,
-          truckId: s.truck_id,
-          truckPlate: s.truck_id,
-          inChargeId: s.in_charge_id || "",
-          inChargeName: s.created_by || "Staff In-Charge",
-          driverId: s.driver_id || "",
-          driverName: "Driver",
-          status: s.status === "Pending" ? "Draft" : (s.status as any),
-          totalLoadedSacks: s.total_loaded_sacks,
-          totalDeliveredSacks: s.total_delivered_sacks,
-          totalReturnedSacks: s.total_returned_sacks,
-          totalRevenue: Number(s.total_cash_revenue) + Number(s.total_charge_revenue),
-          totalCashRevenue: Number(s.total_cash_revenue),
-          totalChargeRevenue: Number(s.total_charge_revenue),
-          items: (s.load_slip_items || []).map((item: any) => ({
-            id: item.id,
-            customerId: item.customer_id || "",
-            storeName: item.customer_name,
-            locationId: item.hub_id,
-            locationName: "Hub",
-            iceProductId: item.product_id || "",
-            iceType: item.product_name,
-            sackSize: "Standard Sack",
-            plannedQty: item.planned_qty,
-            deliveredQty: item.delivered_qty,
-            unitPrice: Number(item.unit_price),
-            totalPrice: Number(item.total_amount),
-            paymentType: item.payment_mode === "Charge" ? "Charge Invoice" : "Cash",
-            status: item.delivered_qty >= item.planned_qty ? "Completed" : "Pending",
-            partialReason: item.partial_reason || undefined,
-            deliveredAt: item.delivered_at || undefined
-          })),
-          createdAt: s.created_at,
-          updatedAt: s.updated_at
-        }));
+      if (!slipsRes.error && slipsRes.data) {
+        const mappedSlips = slipsRes.data.map(s => mapDbSlipToWeb(s, usersMap, trucksMap));
         setStorageItem(STORAGE_KEYS.LOAD_SLIPS, mappedSlips);
       }
 
       return { success: true };
     } catch (e: any) {
-      console.warn("Supabase fetch failed, continuing with offline cache:", e.message);
-      return { success: false, error: e.message };
+      console.warn("Supabase fetch notice:", e?.message);
+      return { success: false, error: e?.message };
     }
   }
 
-  // --- CURRENT USER & AUTH ---
-  static getCurrentUser(): UserAccount {
-    return getStorageItem<UserAccount>(STORAGE_KEYS.CURRENT_USER, CURRENT_USER);
-  }
-
-  static setCurrentUser(user: UserAccount): void {
-    setStorageItem(STORAGE_KEYS.CURRENT_USER, user);
-  }
-
-  // --- TRASH & RECOVERY (UNIVERSAL 30-DAY SOFT DELETE) ---
+  // --- TRASH & RECOVERY ---
   static async fetchTrashItems(): Promise<any[]> {
     try {
-      const res = await fetch(`${BACKEND_URL}/api/v1/trash/items`);
+      const res = await this.authorizedFetch(`${BACKEND_URL}/api/v1/trash/items`);
       if (res.ok) {
         const json = await res.json();
         return json.items || [];
       }
-    } catch (err) {
-      console.warn("Backend trash API unreachable, scanning Supabase directly:", err);
+    } catch {
+      // Fallback below
     }
 
-    // Direct Supabase fallback
     const items: any[] = [];
     const tables = ["load_slips", "invoices", "products", "trucks", "delivery_hubs", "customers", "user_accounts"];
     const now = Date.now();
@@ -317,50 +462,60 @@ export class DataService {
           }
         }
       } catch {
-        // Table might not have deleted_at yet
+        // ignore missing columns
       }
     }
     return items;
   }
 
   static async softDeleteItem(entityType: string, id: string, deletedBy?: string): Promise<{ success: boolean; message: string }> {
-    const staff = deletedBy || this.getCurrentUser().name || "Staff";
+    const staff = deletedBy || this.getCurrentUser()?.name || "Staff";
     try {
-      const res = await fetch(`${BACKEND_URL}/api/v1/trash/soft-delete`, {
+      const res = await this.authorizedFetch(`${BACKEND_URL}/api/v1/trash/soft-delete`, {
         method: "POST",
-        headers: { "Content-Type": "application/json" },
         body: JSON.stringify({ entity_type: entityType, entity_id: id, deleted_by: staff })
       });
+      const json = await res.json().catch(() => ({}));
       if (res.ok) {
-        return { success: true, message: `${entityType} moved to Trash.` };
+        return { success: true, message: json.message || `${entityType} moved to Trash.` };
       }
-    } catch (err) {
-      console.warn("Backend soft-delete failed, falling back to Supabase direct:", err);
+      if (res.status === 409) {
+        return { success: false, message: json.detail || "Item is currently in active use." };
+      }
+    } catch {
+      // fallback
     }
 
     const now = new Date().toISOString();
-    const { error } = await supabase.from(entityType).update({ deleted_at: now, deleted_by: staff, is_active: false }).eq("id", id);
+    const payload: any = { deleted_at: now, deleted_by: staff };
+    if (["trucks", "products", "delivery_hubs", "customers", "user_accounts"].includes(entityType)) {
+      payload.is_active = false;
+    }
+    const { error } = await supabase.from(entityType).update(payload).eq("id", id);
     if (error) return { success: false, message: error.message };
     return { success: true, message: `${entityType} moved to Trash.` };
   }
 
   static async restoreTrashItem(entityType: string, id: string, restoredBy?: string): Promise<{ success: boolean; message: string }> {
-    const staff = restoredBy || this.getCurrentUser().name || "Staff";
+    const staff = restoredBy || this.getCurrentUser()?.name || "Staff";
     try {
-      const res = await fetch(`${BACKEND_URL}/api/v1/trash/restore`, {
+      const res = await this.authorizedFetch(`${BACKEND_URL}/api/v1/trash/restore`, {
         method: "POST",
-        headers: { "Content-Type": "application/json" },
         body: JSON.stringify({ entity_type: entityType, entity_id: id, restored_by: staff })
       });
       if (res.ok) {
         await this.fetchLiveFromSupabase();
         return { success: true, message: `${entityType} item restored.` };
       }
-    } catch (err) {
-      console.warn("Backend restore failed, falling back to Supabase direct:", err);
+    } catch {
+      // fallback
     }
 
-    const { error } = await supabase.from(entityType).update({ deleted_at: null, deleted_by: null, is_active: true }).eq("id", id);
+    const payload: any = { deleted_at: null, deleted_by: null };
+    if (["trucks", "products", "delivery_hubs", "customers", "user_accounts"].includes(entityType)) {
+      payload.is_active = true;
+    }
+    const { error } = await supabase.from(entityType).update(payload).eq("id", id);
     if (error) return { success: false, message: error.message };
     await this.fetchLiveFromSupabase();
     return { success: true, message: `${entityType} item restored.` };
@@ -368,76 +523,80 @@ export class DataService {
 
   static async deleteForeverTrashItem(entityType: string, id: string, adminUserId: string): Promise<{ success: boolean; message: string }> {
     try {
-      const res = await fetch(`${BACKEND_URL}/api/v1/trash/delete-forever`, {
+      const res = await this.authorizedFetch(`${BACKEND_URL}/api/v1/trash/delete-forever`, {
         method: "POST",
-        headers: { "Content-Type": "application/json" },
         body: JSON.stringify({ entity_type: entityType, entity_id: id, admin_user_id: adminUserId })
       });
-      const data = await res.json();
+      const data = await res.json().catch(() => ({}));
       if (res.ok) {
         return { success: true, message: "Record permanently purged from database." };
-      } else {
-        return { success: false, message: data.detail || "Failed to permanently delete item." };
       }
+      return { success: false, message: data.detail || "Failed to permanently delete item." };
     } catch (err: any) {
       return { success: false, message: err.message || "Network error reaching backend." };
     }
   }
 
-  static deleteInvoice(id: string, deletedBy?: string): void {
-    const invoices = this.getInvoices().filter(i => i.id !== id);
-    setStorageItem(STORAGE_KEYS.INVOICES, invoices);
-    this.softDeleteItem("invoices", id, deletedBy);
+  static async deleteInvoice(id: string, deletedBy?: string): Promise<{ success: boolean; message: string }> {
+    const res = await this.softDeleteItem("invoices", id, deletedBy);
+    if (res.success) {
+      const invoices = this.getInvoices().filter(i => i.id !== id);
+      setStorageItem(STORAGE_KEYS.INVOICES, invoices);
+    }
+    return res;
   }
 
-  static deleteLoadSlip(id: string, deletedBy?: string): void {
-    const slips = this.getHistoricalLoadSlips().filter(s => s.id !== id);
-    setStorageItem(STORAGE_KEYS.LOAD_SLIPS, slips);
-    this.softDeleteItem("load_slips", id, deletedBy);
+  static async deleteLoadSlip(id: string, deletedBy?: string): Promise<{ success: boolean; message: string }> {
+    const res = await this.softDeleteItem("load_slips", id, deletedBy);
+    if (res.success) {
+      const slips = this.getHistoricalLoadSlips().filter(s => s.id !== id);
+      setStorageItem(STORAGE_KEYS.LOAD_SLIPS, slips);
+    }
+    return res;
   }
 
-  // --- LOCATIONS ---
+  // --- DELIVERY HUBS ---
   static getLocations(): DeliveryLocation[] {
-    const locs = getStorageItem<DeliveryLocation[]>(STORAGE_KEYS.LOCATIONS, INITIAL_LOCATIONS);
+    const locs = getStorageItem<DeliveryLocation[]>(STORAGE_KEYS.LOCATIONS, []);
     return Array.isArray(locs) ? locs : [];
   }
 
-  static addLocation(newLoc: Omit<DeliveryLocation, "id" | "customersCount">): DeliveryLocation {
-    const locations = this.getLocations();
+  static async addLocation(newLoc: Omit<DeliveryLocation, "id" | "customersCount">): Promise<{ success: boolean; location?: DeliveryLocation; message?: string }> {
     const id = generateUUID();
-    const location: DeliveryLocation = {
-      id,
-      ...newLoc,
-      customersCount: 0
-    };
-    const updated = [location, ...locations];
-    setStorageItem(STORAGE_KEYS.LOCATIONS, updated);
+    const location: DeliveryLocation = { id, ...newLoc, customersCount: 0 };
 
-    // Sync to Supabase in background
-    supabase.from("delivery_hubs").insert({
+    const { error } = await supabase.from("delivery_hubs").insert({
       id,
       code: `HUB-${id.substring(0, 8).toUpperCase()}`,
       name: newLoc.name,
       address: newLoc.address,
       latitude: newLoc.latitude,
       longitude: newLoc.longitude,
+      zone: newLoc.zone,
       is_active: true
-    }).then(({ error }) => {
-      if (error) console.error("Error inserting delivery hub into Supabase:", error);
     });
 
-    return location;
+    if (error) {
+      return { success: false, message: error.message };
+    }
+
+    const updated = [location, ...this.getLocations()];
+    setStorageItem(STORAGE_KEYS.LOCATIONS, updated);
+    return { success: true, location };
   }
 
-  static deleteLocation(id: string, deletedBy?: string): void {
-    const locations = this.getLocations().filter(l => l.id !== id);
-    setStorageItem(STORAGE_KEYS.LOCATIONS, locations);
-    this.softDeleteItem("delivery_hubs", id, deletedBy);
+  static async deleteLocation(id: string, deletedBy?: string): Promise<{ success: boolean; message: string }> {
+    const res = await this.softDeleteItem("delivery_hubs", id, deletedBy);
+    if (res.success) {
+      const locations = this.getLocations().filter(l => l.id !== id);
+      setStorageItem(STORAGE_KEYS.LOCATIONS, locations);
+    }
+    return res;
   }
 
-  // --- STORE CUSTOMERS ---
+  // --- CUSTOMERS ---
   static getCustomers(): StoreCustomer[] {
-    const custs = getStorageItem<StoreCustomer[]>(STORAGE_KEYS.CUSTOMERS, INITIAL_CUSTOMERS);
+    const custs = getStorageItem<StoreCustomer[]>(STORAGE_KEYS.CUSTOMERS, []);
     return Array.isArray(custs) ? custs : [];
   }
 
@@ -445,136 +604,283 @@ export class DataService {
     return this.getCustomers().filter(c => c && c.locationId === locationId);
   }
 
-  // --- PRODUCTS ---
+  // --- ICE PRODUCTS (ALLOW >= 0 PRICE) ---
   static getProducts(): IceProduct[] {
-    const prods = getStorageItem<IceProduct[]>(STORAGE_KEYS.PRODUCTS, INITIAL_PRODUCTS);
+    const prods = getStorageItem<IceProduct[]>(STORAGE_KEYS.PRODUCTS, []);
     return Array.isArray(prods) ? prods : [];
   }
 
-  static addProduct(prod: Omit<IceProduct, "id">): IceProduct {
-    const products = this.getProducts();
+  static async addProduct(prod: Omit<IceProduct, "id">): Promise<{ success: boolean; product?: IceProduct; message?: string }> {
+    const safePrice = roundCurrency(Math.max(0, Number(prod.price) || 0));
     const id = generateUUID();
-    const newProduct: IceProduct = {
-      id,
-      ...prod
-    };
-    const updated = [...products, newProduct];
-    setStorageItem(STORAGE_KEYS.PRODUCTS, updated);
+    const newProduct: IceProduct = { id, ...prod, price: safePrice };
 
-    // Sync to Supabase
-    supabase.from("products").insert({
+    try {
+      const res = await this.authorizedFetch(`${BACKEND_URL}/api/v1/products`, {
+        method: "POST",
+        body: JSON.stringify({
+          id,
+          name: prod.name,
+          category: prod.category,
+          sack_size: prod.sackSize,
+          standard_price: safePrice,
+          image_url: prod.imageUrl || null
+        })
+      });
+      if (res.ok) {
+        const updated = [...this.getProducts(), newProduct];
+        setStorageItem(STORAGE_KEYS.PRODUCTS, updated);
+        return { success: true, product: newProduct };
+      }
+    } catch {
+      // Fallback direct Supabase
+    }
+
+    const { error } = await supabase.from("products").insert({
       id,
       code: `PROD-${id.substring(0, 8).toUpperCase()}`,
       name: prod.name,
       description: prod.category,
-      sack_weight_kg: 50.00,
-      standard_price: prod.price,
+      category: prod.category,
+      sack_size: prod.sackSize,
+      sack_weight_kg: 50.0,
+      standard_price: safePrice,
       image_url: prod.imageUrl || null,
       is_active: true
-    }).then(({ error }) => {
-      if (error) console.error("Error inserting product into Supabase:", error);
     });
+    if (error) return { success: false, message: error.message };
 
-    return newProduct;
+    setStorageItem(STORAGE_KEYS.PRODUCTS, [...this.getProducts(), newProduct]);
+    return { success: true, product: newProduct };
   }
 
-  static updateProductPrice(id: string, newPrice: number): void {
-    const products = this.getProducts().map(p => p.id === id ? { ...p, price: newPrice } : p);
+  static async updateProductPrice(id: string, newPrice: number): Promise<boolean> {
+    const safePrice = roundCurrency(Math.max(0, Number(newPrice) || 0));
+    const products = this.getProducts().map(p => (p.id === id ? { ...p, price: safePrice } : p));
     setStorageItem(STORAGE_KEYS.PRODUCTS, products);
 
-    supabase.from("products").update({ standard_price: newPrice }).eq("id", id).then(({ error }) => {
-      if (error) console.error("Error updating product price in Supabase:", error);
-    });
+    try {
+      const res = await this.authorizedFetch(`${BACKEND_URL}/api/v1/products/${id}`, {
+        method: "PUT",
+        body: JSON.stringify({ standard_price: safePrice })
+      });
+      if (res.ok) return true;
+    } catch {
+      // fallback
+    }
+
+    const { error } = await supabase.from("products").update({ standard_price: safePrice }).eq("id", id);
+    return !error;
   }
 
-  static updateProduct(id: string, updates: Partial<IceProduct>): IceProduct | null {
+  static async updateProduct(id: string, updates: Partial<IceProduct>): Promise<IceProduct | null> {
     const products = this.getProducts();
     const index = products.findIndex(p => p.id === id);
-    if (index === -1) return null;
-    const updated = { ...products[index], ...updates };
-    products[index] = updated;
-    setStorageItem(STORAGE_KEYS.PRODUCTS, products);
+    const normalizedPrice = updates.price !== undefined ? roundCurrency(Math.max(0, updates.price)) : undefined;
+
+    if (index >= 0) {
+      products[index] = { ...products[index], ...updates, ...(normalizedPrice !== undefined ? { price: normalizedPrice } : {}) };
+      setStorageItem(STORAGE_KEYS.PRODUCTS, products);
+    }
 
     const dbPayload: any = {};
-    if (updates.price !== undefined) dbPayload.standard_price = updates.price;
+    if (normalizedPrice !== undefined) dbPayload.standard_price = normalizedPrice;
     if (updates.name !== undefined) dbPayload.name = updates.name;
+    if (updates.category !== undefined) {
+      dbPayload.category = updates.category;
+      dbPayload.description = updates.category;
+    }
+    if (updates.sackSize !== undefined) dbPayload.sack_size = updates.sackSize;
     if (updates.imageUrl !== undefined) dbPayload.image_url = updates.imageUrl;
 
     if (Object.keys(dbPayload).length > 0) {
-      supabase.from("products").update(dbPayload).eq("id", id).then(({ error }) => {
-        if (error) console.error("Error updating product in Supabase:", error);
-      });
+      try {
+        const res = await this.authorizedFetch(`${BACKEND_URL}/api/v1/products/${id}`, {
+          method: "PUT",
+          body: JSON.stringify(dbPayload)
+        });
+        if (!res.ok) {
+          await supabase.from("products").update(dbPayload).eq("id", id);
+        }
+      } catch {
+        await supabase.from("products").update(dbPayload).eq("id", id);
+      }
     }
 
-    return updated;
+    return index >= 0 ? products[index] : null;
   }
 
-  static deleteProduct(id: string, deletedBy?: string): void {
-    const products = this.getProducts().filter(p => p.id !== id);
-    setStorageItem(STORAGE_KEYS.PRODUCTS, products);
-    this.softDeleteItem("products", id, deletedBy);
+  static async deleteProduct(id: string, deletedBy?: string): Promise<{ success: boolean; message: string }> {
+    const res = await this.softDeleteItem("products", id, deletedBy);
+    if (res.success) {
+      const products = this.getProducts().filter(p => p.id !== id);
+      setStorageItem(STORAGE_KEYS.PRODUCTS, products);
+    }
+    return res;
   }
 
-  // --- TRUCKS & ROSTER ---
+  // --- TRUCKS & CAPACITY ---
   static getTrucks(): TruckVehicle[] {
-    const trks = getStorageItem<TruckVehicle[]>(STORAGE_KEYS.TRUCKS, INITIAL_TRUCKS);
+    const trks = getStorageItem<TruckVehicle[]>(STORAGE_KEYS.TRUCKS, []);
     return Array.isArray(trks) ? trks : [];
   }
 
-  static addTruck(truckData: Omit<TruckVehicle, "status"> & { status?: TruckVehicle["status"] }): TruckVehicle {
-    const trucks = this.getTrucks();
+  static async fetchTrucksCapacity(): Promise<TruckCapacityInfo[]> {
+    try {
+      const res = await this.authorizedFetch(`${BACKEND_URL}/api/v1/trucks/capacity`);
+      if (res.ok) {
+        const json = await res.json();
+        return (json.data || []).map((t: any) => ({
+          truckId: t.truck_id,
+          plateNumber: t.plate_number,
+          model: t.model,
+          sackCapacity: Number(t.sack_capacity || 120),
+          usedSacks: Number(t.used_sacks || 0),
+          remainingCapacity: Number(t.remaining_capacity ?? Math.max(0, Number(t.sack_capacity || 120) - Number(t.used_sacks || 0))),
+          activeSlipsCount: Number(t.active_slips_count || 0),
+          isInTransit: Boolean(t.is_in_transit)
+        }));
+      }
+    } catch {
+      // Fallback calculation via Supabase directly
+    }
+
+    const [{ data: dbTrucks }, { data: dbSlips }] = await Promise.all([
+      supabase.from("trucks").select("*").eq("is_active", true).is("deleted_at", null).order("id"),
+      supabase.from("load_slips").select("id, truck_id, status, total_loaded_sacks").is("deleted_at", null)
+    ]);
+
+    const doneStatuses = new Set(["REMITTED", "COMPLETED", "RECONCILED", "CANCELLED"]);
+    const usage = new Map<string, { used: number; count: number; inTransit: boolean }>();
+    (dbSlips || []).forEach((s: any) => {
+      const st = String(s.status || "").toUpperCase();
+      if (doneStatuses.has(st)) return;
+      const cur = usage.get(s.truck_id) || { used: 0, count: 0, inTransit: false };
+      cur.used += Number(s.total_loaded_sacks || 0);
+      cur.count += 1;
+      if (st === "IN_TRANSIT" || st === "IN-TRANSIT") cur.inTransit = true;
+      usage.set(s.truck_id, cur);
+    });
+
+    return (dbTrucks || []).map((t: any) => {
+      const cap = Number(t.sack_capacity ?? t.max_sack_capacity ?? 120);
+      const u = usage.get(t.id) || { used: 0, count: 0, inTransit: false };
+      return {
+        truckId: t.id,
+        plateNumber: t.plate_number,
+        model: t.model,
+        sackCapacity: cap,
+        usedSacks: u.used,
+        remainingCapacity: Math.max(0, cap - u.used),
+        activeSlipsCount: u.count,
+        isInTransit: u.inTransit
+      };
+    });
+  }
+
+  static async addTruck(truckData: Omit<TruckVehicle, "status"> & { status?: TruckVehicle["status"] }): Promise<{ success: boolean; truck?: TruckVehicle; message?: string }> {
+    const cap = Math.max(1, Number(truckData.capacitySacks ?? truckData.sackCapacity ?? 120));
     const newTruck: TruckVehicle = {
       ...truckData,
+      capacitySacks: cap,
+      sackCapacity: cap,
       status: truckData.status || "Available"
     };
-    const updated = [...trucks, newTruck];
-    setStorageItem(STORAGE_KEYS.TRUCKS, updated);
 
-    supabase.from("trucks").insert({
+    try {
+      const res = await this.authorizedFetch(`${BACKEND_URL}/api/v1/trucks`, {
+        method: "POST",
+        body: JSON.stringify({
+          id: truckData.id,
+          plate_number: truckData.plateNumber,
+          model: truckData.model,
+          sack_capacity: cap,
+          image_url: truckData.imageUrl || null
+        })
+      });
+      if (res.ok) {
+        const existing = this.getTrucks().filter(t => t.id !== newTruck.id);
+        setStorageItem(STORAGE_KEYS.TRUCKS, [...existing, newTruck]);
+        return { success: true, truck: newTruck };
+      }
+    } catch {
+      // Fallback
+    }
+
+    const { error } = await supabase.from("trucks").upsert({
       id: truckData.id,
       plate_number: truckData.plateNumber,
       model: truckData.model,
-      max_sack_capacity: truckData.capacitySacks,
+      sack_capacity: cap,
+      max_sack_capacity: cap,
       image_url: truckData.imageUrl || null,
-      is_active: true
-    }).then(({ error }) => {
-      if (error) console.error("Error inserting truck into Supabase:", error);
-    });
+      is_active: true,
+      deleted_at: null,
+      deleted_by: null
+    }, { onConflict: "id" });
 
-    return newTruck;
+    if (error) return { success: false, message: error.message };
+    const existing = this.getTrucks().filter(t => t.id !== newTruck.id);
+    setStorageItem(STORAGE_KEYS.TRUCKS, [...existing, newTruck]);
+    return { success: true, truck: newTruck };
   }
 
-  static updateTruck(id: string, updates: Partial<TruckVehicle>): TruckVehicle | null {
-    const trucks = this.getTrucks();
-    const index = trucks.findIndex(t => t.id === id);
-    if (index === -1) return null;
-    const updated = { ...trucks[index], ...updates };
-    trucks[index] = updated;
-    setStorageItem(STORAGE_KEYS.TRUCKS, trucks);
-
+  static async updateTruck(id: string, updates: Partial<TruckVehicle>): Promise<{ success: boolean; truck?: TruckVehicle | null; message?: string }> {
+    const cap = updates.capacitySacks !== undefined ? Math.max(1, Number(updates.capacitySacks)) : updates.sackCapacity;
     const dbPayload: any = {};
-    if (updates.plateNumber) dbPayload.plate_number = updates.plateNumber;
-    if (updates.model) dbPayload.model = updates.model;
-    if (updates.capacitySacks) dbPayload.max_sack_capacity = updates.capacitySacks;
+    if (updates.plateNumber) dbPayload.plate_number = updates.plateNumber.trim().toUpperCase();
+    if (updates.model) dbPayload.model = updates.model.trim();
+    if (cap !== undefined) {
+      dbPayload.sack_capacity = cap;
+      dbPayload.max_sack_capacity = cap;
+    }
     if (updates.imageUrl !== undefined) dbPayload.image_url = updates.imageUrl;
 
-    if (Object.keys(dbPayload).length > 0) {
-      supabase.from("trucks").update(dbPayload).eq("id", id).then(({ error }) => {
-        if (error) console.error("Error updating truck in Supabase:", error);
+    try {
+      const res = await this.authorizedFetch(`${BACKEND_URL}/api/v1/trucks/${encodeURIComponent(id)}`, {
+        method: "PUT",
+        body: JSON.stringify({
+          plate_number: dbPayload.plate_number,
+          model: dbPayload.model,
+          sack_capacity: cap,
+          image_url: updates.imageUrl
+        })
       });
+      if (!res.ok) {
+        const { error } = await supabase.from("trucks").update(dbPayload).eq("id", id);
+        if (error) return { success: false, message: error.message };
+      }
+    } catch {
+      const { error } = await supabase.from("trucks").update(dbPayload).eq("id", id);
+      if (error) return { success: false, message: error.message };
     }
 
-    return updated;
+    const trucks = this.getTrucks();
+    const index = trucks.findIndex(t => t.id === id);
+    if (index >= 0) {
+      trucks[index] = {
+        ...trucks[index],
+        ...updates,
+        ...(cap !== undefined ? { capacitySacks: cap, sackCapacity: cap } : {})
+      };
+      setStorageItem(STORAGE_KEYS.TRUCKS, trucks);
+      return { success: true, truck: trucks[index] };
+    }
+    return { success: true, truck: null };
   }
 
-  static deleteTruck(id: string, deletedBy?: string): void {
-    const trucks = this.getTrucks().filter(t => t.id !== id);
-    setStorageItem(STORAGE_KEYS.TRUCKS, trucks);
-    this.softDeleteItem("trucks", id, deletedBy);
+  static async deleteTruck(id: string, deletedBy?: string): Promise<{ success: boolean; message: string }> {
+    const res = await this.softDeleteItem("trucks", id, deletedBy);
+    if (res.success) {
+      const trucks = this.getTrucks().filter(t => t.id !== id);
+      setStorageItem(STORAGE_KEYS.TRUCKS, trucks);
+    }
+    return res;
   }
 
+  // --- USERS & PERSONNEL ---
   static getUsers(): UserAccount[] {
-    const users = getStorageItem<UserAccount[]>(STORAGE_KEYS.USERS, INITIAL_USERS);
+    const users = getStorageItem<UserAccount[]>(STORAGE_KEYS.USERS, []);
     return Array.isArray(users) ? users : [];
   }
 
@@ -586,37 +892,13 @@ export class DataService {
     return this.getUsers().filter(u => u && (u.role === "Staff" || u.role === "Owner") && u.active);
   }
 
-  static addUser(newUserData: Omit<UserAccount, "id" | "createdAt">): UserAccount {
-    const users = this.getUsers();
+  static async addUser(newUserData: Omit<UserAccount, "id" | "createdAt">): Promise<{ success: boolean; user?: UserAccount; message?: string }> {
     const id = generateUUID();
-    const newUser: UserAccount = {
-      id,
-      ...newUserData,
-      createdAt: new Date().toISOString(),
-      active: true
-    };
-    const updated = [...users, newUser];
-    setStorageItem(STORAGE_KEYS.USERS, updated);
-
-    // Securely route through FastAPI backend (bcrypt password hashing)
-    fetch(`${BACKEND_URL}/api/v1/users`, {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({
-        full_name: newUserData.name,
-        role: newUserData.role,
-        username: newUserData.username || null,
-        password: newUserData.password || "1234",
-        mobile_pin: newUserData.password || "1234",
-        phone_number: newUserData.phone || null,
-        email: newUserData.email || null,
-        assigned_truck_id: newUserData.assignedTruckId || null,
-        photo_url: newUserData.photoUrl || null
-      })
-    }).then(async res => {
-      if (!res.ok) {
-        // Fallback to Supabase
-        supabase.from("user_accounts").insert({
+    try {
+      const res = await fetch(`${BACKEND_URL}/api/v1/users`, {
+        method: "POST",
+        headers: this.getAuthHeaders(),
+        body: JSON.stringify({
           id,
           full_name: newUserData.name,
           role: newUserData.role,
@@ -625,233 +907,169 @@ export class DataService {
           mobile_pin: newUserData.password || "1234",
           phone_number: newUserData.phone || null,
           email: newUserData.email || null,
-          photo_url: newUserData.photoUrl || null,
           assigned_truck_id: newUserData.assignedTruckId || null,
-          is_active: true
-        }).then(({ error }) => {
-          if (error) console.error("Error inserting user into Supabase:", error);
-        });
-      }
-    }).catch(err => {
-      console.warn("Backend user creation note, using Supabase fallback:", err);
-      supabase.from("user_accounts").insert({
-        id,
-        full_name: newUserData.name,
-        role: newUserData.role,
-        username: newUserData.username || null,
-        password: newUserData.password || "1234",
-        mobile_pin: newUserData.password || "1234",
-        phone_number: newUserData.phone || null,
-        email: newUserData.email || null,
-        photo_url: newUserData.photoUrl || null,
-        assigned_truck_id: newUserData.assignedTruckId || null,
-        is_active: true
+          photo_url: newUserData.photoUrl || null
+        })
       });
-    });
-
-    return newUser;
+      const json = await res.json().catch(() => ({}));
+      if (res.ok && json.user) {
+        const created: UserAccount = {
+          id: json.user.id,
+          name: json.user.full_name,
+          username: json.user.username,
+          email: json.user.email || "",
+          role: json.user.role,
+          phone: json.user.phone_number,
+          assignedTruckId: json.user.assigned_truck_id,
+          photoUrl: json.user.photo_url,
+          active: true,
+          createdAt: json.user.created_at || new Date().toISOString()
+        };
+        setStorageItem(STORAGE_KEYS.USERS, [...this.getUsers(), created]);
+        return { success: true, user: created };
+      }
+      return { success: false, message: json.detail || "Failed to create user." };
+    } catch (err: any) {
+      return { success: false, message: err.message || "Network error creating user." };
+    }
   }
 
-  static updateUser(id: string, updates: Partial<UserAccount>): UserAccount | null {
+  static async updateUser(id: string, updates: Partial<UserAccount>): Promise<UserAccount | null> {
     const users = this.getUsers();
     const index = users.findIndex(u => u.id === id);
-    if (index === -1) return null;
-    const updatedUser = { ...users[index], ...updates };
-    users[index] = updatedUser;
-    setStorageItem(STORAGE_KEYS.USERS, users);
-
-    const dbPayload: any = {};
-    if (updates.name) dbPayload.full_name = updates.name;
-    if (updates.role) dbPayload.role = updates.role;
-    if (updates.username !== undefined) dbPayload.username = updates.username;
-    if (updates.password !== undefined) {
-      dbPayload.password = updates.password;
-      dbPayload.mobile_pin = updates.password;
+    if (index >= 0) {
+      users[index] = { ...users[index], ...updates };
+      setStorageItem(STORAGE_KEYS.USERS, users);
     }
-    if (updates.phone !== undefined) dbPayload.phone_number = updates.phone;
-    if (updates.email !== undefined) dbPayload.email = updates.email;
-    if (updates.photoUrl !== undefined) dbPayload.photo_url = updates.photoUrl;
-    if (updates.assignedTruckId !== undefined) dbPayload.assigned_truck_id = updates.assignedTruckId || null;
-    if (updates.active !== undefined) dbPayload.is_active = updates.active;
 
-    if (Object.keys(dbPayload).length > 0) {
-      supabase.from("user_accounts").update(dbPayload).eq("id", id).then(({ error }) => {
-        if (error) console.error("Error updating user in Supabase:", error);
+    try {
+      await fetch(`${BACKEND_URL}/api/v1/users/${id}`, {
+        method: "PUT",
+        headers: this.getAuthHeaders(),
+        body: JSON.stringify({
+          full_name: updates.name,
+          role: updates.role,
+          username: updates.username,
+          password: updates.password,
+          mobile_pin: updates.password,
+          phone_number: updates.phone,
+          email: updates.email,
+          assigned_truck_id: updates.assignedTruckId ?? null,
+          photo_url: updates.photoUrl,
+          is_active: updates.active
+        })
       });
+    } catch {
+      const dbPayload: any = {};
+      if (updates.name) dbPayload.full_name = updates.name;
+      if (updates.role) dbPayload.role = updates.role;
+      if (updates.username !== undefined) dbPayload.username = updates.username;
+      if (updates.phone !== undefined) dbPayload.phone_number = updates.phone;
+      if (updates.email !== undefined) dbPayload.email = updates.email;
+      if (updates.photoUrl !== undefined) dbPayload.photo_url = updates.photoUrl;
+      if (updates.assignedTruckId !== undefined) dbPayload.assigned_truck_id = updates.assignedTruckId || null;
+      if (Object.keys(dbPayload).length > 0) {
+        await supabase.from("user_accounts").update(dbPayload).eq("id", id);
+      }
     }
 
-    return updatedUser;
+    return index >= 0 ? users[index] : null;
   }
 
-  static deleteUser(id: string, deletedBy?: string): void {
-    const users = this.getUsers().filter(u => u.id !== id);
-    setStorageItem(STORAGE_KEYS.USERS, users);
-    this.softDeleteItem("user_accounts", id, deletedBy);
+  static async deleteUser(id: string, deletedBy?: string): Promise<void> {
+    const res = await this.softDeleteItem("user_accounts", id, deletedBy);
+    if (res.success) {
+      setStorageItem(STORAGE_KEYS.USERS, this.getUsers().filter(u => u.id !== id));
+    }
   }
 
-  // Password reset/management with bcrypt hashing
-  static resetUserPassword(userId: string, newPass: string, adminUserId?: string): { success: boolean; message: string } {
+  static async resetUserPassword(userId: string, newPass: string, adminUserId?: string): Promise<{ success: boolean; message: string }> {
     if (!newPass || newPass.length < 4) {
       return { success: false, message: "Password must be at least 4 characters long." };
     }
-    const users = this.getUsers();
-    const user = users.find(u => u.id === userId);
-    if (!user) {
-      return { success: false, message: "User account not found." };
-    }
-    user.password = newPass;
-    setStorageItem(STORAGE_KEYS.USERS, users);
-
-    const adminId = adminUserId || this.getCurrentUser().id;
-
-    // Route through backend with bcrypt hashing
-    fetch(`${BACKEND_URL}/api/v1/auth/admin-reset-password`, {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({
-        admin_user_id: adminId,
-        target_user_id: userId,
-        new_password: newPass
-      })
-    }).then(async res => {
-      if (!res.ok) {
-        supabase.from("user_accounts").update({ password: newPass, mobile_pin: newPass }).eq("id", userId);
+    const adminId = adminUserId || this.getCurrentUser()?.id || "";
+    try {
+      const res = await this.authorizedFetch(`${BACKEND_URL}/api/v1/auth/admin-reset-password`, {
+        method: "POST",
+        body: JSON.stringify({
+          admin_user_id: adminId,
+          target_user_id: userId,
+          new_password: newPass
+        })
+      });
+      const json = await res.json().catch(() => ({}));
+      if (res.ok) {
+        return { success: true, message: json.message || "Password reset successfully." };
       }
-    }).catch(err => {
-      console.warn("Backend reset note, falling back to direct update:", err);
-      supabase.from("user_accounts").update({ password: newPass, mobile_pin: newPass }).eq("id", userId);
-    });
-
-    return {
-      success: true,
-      message: `Password successfully reset for ${user.name} (${user.role}).`
-    };
+      return { success: false, message: json.detail || "Unable to reset password." };
+    } catch (e: any) {
+      return { success: false, message: e.message || "Network error resetting password." };
+    }
   }
 
-  static changeUserPassword(userIdOrUsername: string, oldPass: string, newPass: string): { success: boolean; message: string } {
+  static async changeUserPassword(userIdOrUsername: string, oldPass: string, newPass: string): Promise<{ success: boolean; message: string }> {
     if (!newPass || newPass.length < 4) {
       return { success: false, message: "New password must be at least 4 characters long." };
     }
-    const users = this.getUsers();
-    const user = users.find(u => u.id === userIdOrUsername || u.username?.toLowerCase() === userIdOrUsername.toLowerCase());
-    if (!user) {
-      return { success: false, message: "User account not found." };
-    }
-    const expectedOld = user.password || user.username || "";
-    if (oldPass && expectedOld && oldPass !== expectedOld) {
-      return { success: false, message: "Current password is incorrect." };
-    }
-    user.password = newPass;
-    setStorageItem(STORAGE_KEYS.USERS, users);
+    const user = this.getUsers().find(
+      u => u.id === userIdOrUsername || u.username?.toLowerCase() === userIdOrUsername.toLowerCase()
+    );
+    const targetId = user?.id || userIdOrUsername;
 
-    // Route through backend with bcrypt hashing
-    fetch(`${BACKEND_URL}/api/v1/auth/change-password`, {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({
-        user_id: user.id,
-        old_password: oldPass,
-        new_password: newPass
-      })
-    }).then(async res => {
-      if (!res.ok) {
-        supabase.from("user_accounts").update({ password: newPass, mobile_pin: newPass }).eq("id", user.id);
-      }
-    }).catch(err => {
-      console.warn("Backend change note, falling back to direct update:", err);
-      supabase.from("user_accounts").update({ password: newPass, mobile_pin: newPass }).eq("id", user.id);
-    });
-
-    return {
-      success: true,
-      message: `Password changed successfully for ${user.name} (${user.username || user.role}).`
-    };
-  }
-
-  static async loginUser(username: string, pass: string): Promise<{ success: boolean; token?: string; user?: any; message?: string }> {
     try {
-      const res = await fetch(`${BACKEND_URL}/api/v1/auth/login`, {
+      const res = await this.authorizedFetch(`${BACKEND_URL}/api/v1/auth/change-password`, {
         method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ username, password: pass })
+        body: JSON.stringify({
+          user_id: targetId,
+          old_password: oldPass,
+          new_password: newPass
+        })
       });
-      const data = await res.json();
-      if (res.ok && data.token) {
-        if (typeof window !== "undefined") {
-          localStorage.setItem("jica_auth_token", data.token);
-          if (data.user) {
-            setStorageItem(STORAGE_KEYS.CURRENT_USER, {
-              id: data.user.id,
-              name: data.user.full_name,
-              role: data.user.role,
-              username: data.user.username,
-              email: data.user.email,
-              phone: data.user.phone_number,
-              assignedTruckId: data.user.assigned_truck_id,
-              photoUrl: data.user.photo_url,
-              active: data.user.is_active,
-              createdAt: data.user.created_at
-            });
-          }
-        }
-        return { success: true, token: data.token, user: data.user };
-      } else {
-        return { success: false, message: data.detail || "Invalid login credentials." };
+      const json = await res.json().catch(() => ({}));
+      if (res.ok) {
+        return { success: true, message: json.message || "Password changed successfully." };
       }
-    } catch (err: any) {
-      console.warn("Backend login failed, checking local accounts:", err);
-      const cleanUser = username.trim().toLowerCase();
-      const user = this.getUsers().find(u =>
-        (u.username && u.username.toLowerCase() === cleanUser) ||
-        (u.name && u.name.toLowerCase() === cleanUser)
-      );
-      if (user && (user.password === pass || pass === "owner" || pass === "1234")) {
-        this.setCurrentUser(user);
-        return { success: true, user };
-      }
-      return { success: false, message: "Invalid username or password." };
+      return { success: false, message: json.detail || "Unable to change password." };
+    } catch (e: any) {
+      return { success: false, message: e.message || "Network error changing password." };
     }
   }
 
-  // --- LOAD SLIPS & AUTO-PREFILL ---
+  // --- LOAD SLIPS, ATOMIC DISPATCH & SHIFT CLOSING ---
   static getHistoricalLoadSlips(): LoadSlip[] {
-    const slips = getStorageItem<LoadSlip[]>(STORAGE_KEYS.LOAD_SLIPS, HISTORICAL_LOAD_SLIPS);
+    const slips = getStorageItem<LoadSlip[]>(STORAGE_KEYS.LOAD_SLIPS, []);
     return Array.isArray(slips) ? slips : [];
   }
 
   static getYesterdayLoadSlip(): LoadSlip | null {
     const history = this.getHistoricalLoadSlips();
-    // Return either the yesterday load slip from mock or the latest one from previous days
-    return (history && history.length > 0) ? history[0] : (YESTERDAY_LOAD_SLIP || null);
+    return history.length > 0 ? history[0] : null;
   }
 
   static getTodayLoadSlipTemplate(): {
     isPrefilled: boolean;
     prefilledDate: string;
-    loadSlip: LoadSlip
+    loadSlip: LoadSlip;
   } {
     const yesterday = this.getYesterdayLoadSlip();
-    const todayStr = new Date().toISOString().split("T")[0];
-    const now = new Date();
-    const timeStr = `${now.getHours().toString().padStart(2, "0")}:${now.getMinutes().toString().padStart(2, "0")}`;
+    const todayStr = getManilaDateString();
+    const timeStr = getManilaTimeString();
+    const currentUser = this.getCurrentUser();
+    const trucks = this.getTrucks();
+    const drivers = this.getDrivers();
 
-    // Clean null guard: If no yesterday slip or no items, return blank template cleanly
     if (!yesterday || !Array.isArray(yesterday.items) || yesterday.items.length === 0) {
-      const trucks = this.getTrucks();
-      const staff = this.getStaff();
-      const drivers = this.getDrivers();
-
       const defaultSlip: LoadSlip = {
         id: `LS-${todayStr.replace(/-/g, "")}-01`,
         idempotencyKey: generateUUID(),
         date: todayStr,
         time: timeStr,
-        truckId: trucks.length > 0 ? trucks[0].id : "",
-        truckPlate: trucks.length > 0 ? trucks[0].plateNumber : "",
-        inChargeId: staff.length > 0 ? staff[0].id : "",
-        inChargeName: staff.length > 0 ? staff[0].name : "",
-        driverId: drivers.length > 0 ? drivers[0].id : "",
-        driverName: drivers.length > 0 ? drivers[0].name : "",
+        truckId: trucks[0]?.id || "",
+        truckPlate: trucks[0]?.plateNumber || "",
+        inChargeId: currentUser?.id || "",
+        inChargeName: currentUser?.name || "",
+        driverId: drivers[0]?.id || "",
+        driverName: drivers[0]?.name || "",
         status: "Draft",
         totalLoadedSacks: 0,
         totalDeliveredSacks: 0,
@@ -864,151 +1082,222 @@ export class DataService {
         updatedAt: new Date().toISOString()
       };
 
-      return {
-        isPrefilled: false,
-        prefilledDate: "",
-        loadSlip: defaultSlip
-      };
+      return { isPrefilled: false, prefilledDate: "", loadSlip: defaultSlip };
     }
 
-    // Reset items to Pending and clear delivered quantities
-    const resetItems = yesterday.items.map((item, index) => ({
-      ...item,
-      id: `ITEM-TODAY-${index + 1}`,
-      deliveredQty: 0,
-      status: "Pending" as const,
-      partialReason: undefined,
-      deliveredAt: undefined,
-      totalPrice: (item.plannedQty || 0) * (item.unitPrice || 0)
-    }));
+    const products = this.getProducts();
+    const resetItems = yesterday.items
+      .filter(it => products.length === 0 || products.some(p => p.id === it.iceProductId || p.name === it.iceType))
+      .map((item, index) => {
+        const matchedProd = products.find(p => p.id === item.iceProductId || p.name === item.iceType);
+        const unitPrice = matchedProd ? matchedProd.price : roundCurrency(item.unitPrice);
+        const qty = item.plannedQty || 1;
+        return {
+          ...item,
+          id: `ITEM-${Date.now()}-${index + 1}`,
+          iceProductId: matchedProd?.id || item.iceProductId,
+          iceType: matchedProd?.name || item.iceType,
+          sackSize: matchedProd?.sackSize || item.sackSize,
+          unitPrice,
+          deliveredQty: 0,
+          status: "Pending" as const,
+          partialReason: undefined,
+          deliveredAt: undefined,
+          totalPrice: multiplyCurrency(qty, unitPrice)
+        };
+      });
 
     const totalLoadedSacks = resetItems.reduce((sum, item) => sum + (item.plannedQty || 0), 0);
-    const totalRevenue = resetItems.reduce((sum, item) => sum + (item.totalPrice || 0), 0);
+    const totalCashRevenue = sumCurrency(resetItems.filter(i => i.paymentType === "Cash").map(i => i.totalPrice));
+    const totalChargeRevenue = sumCurrency(resetItems.filter(i => i.paymentType === "Charge Invoice").map(i => i.totalPrice));
 
     const prefilledLoadSlip: LoadSlip = {
       id: `LS-${todayStr.replace(/-/g, "")}-01`,
       idempotencyKey: generateUUID(),
       date: todayStr,
       time: timeStr,
-      truckId: yesterday.truckId || "",
-      truckPlate: yesterday.truckPlate || "",
-      inChargeId: yesterday.inChargeId || "",
-      inChargeName: yesterday.inChargeName || "",
-      driverId: yesterday.driverId || "",
-      driverName: yesterday.driverName || "",
+      truckId: yesterday.truckId || trucks[0]?.id || "",
+      truckPlate: yesterday.truckPlate || trucks[0]?.plateNumber || "",
+      inChargeId: currentUser?.id || "",
+      inChargeName: currentUser?.name || "",
+      driverId: yesterday.driverId || drivers[0]?.id || "",
+      driverName: yesterday.driverName || drivers[0]?.name || "",
       status: "Draft",
       totalLoadedSacks,
       totalDeliveredSacks: 0,
       totalReturnedSacks: 0,
-      totalRevenue,
-      totalCashRevenue: resetItems.filter(i => i.paymentType === "Cash").reduce((s, i) => s + (i.totalPrice || 0), 0),
-      totalChargeRevenue: resetItems.filter(i => i.paymentType === "Charge Invoice").reduce((s, i) => s + (i.totalPrice || 0), 0),
+      totalRevenue: roundCurrency(totalCashRevenue + totalChargeRevenue),
+      totalCashRevenue,
+      totalChargeRevenue,
       items: resetItems,
       createdAt: new Date().toISOString(),
       updatedAt: new Date().toISOString()
     };
 
     return {
-      isPrefilled: true,
+      isPrefilled: resetItems.length > 0,
       prefilledDate: yesterday.date || todayStr,
       loadSlip: prefilledLoadSlip
     };
   }
 
-  static saveLoadSlip(loadSlip: LoadSlip): { success: boolean; message: string; loadSlip: LoadSlip } {
-    const existingHistory = this.getHistoricalLoadSlips();
+  /**
+   * Dispatches Load Slip synchronously through FastAPI atomic RPC endpoint.
+   * Rejects capacity overbooking cleanly with 409 message.
+   */
+  static async dispatchLoadSlip(loadSlip: LoadSlip): Promise<{
+    success: boolean;
+    message: string;
+    statusCode?: number;
+    loadSlip?: LoadSlip;
+    remainingCapacity?: number;
+    inTransitWarning?: boolean;
+  }> {
+    const locations = this.getLocations();
+    const body = {
+      slip_number: loadSlip.slipNumber || loadSlip.id,
+      idempotency_key: loadSlip.idempotencyKey || generateUUID(),
+      date: loadSlip.date || getManilaDateString(),
+      departure_time: loadSlip.time || getManilaTimeString(),
+      truck_id: loadSlip.truckId,
+      driver_id: isUUID(loadSlip.driverId) ? loadSlip.driverId : null,
+      driver_name: loadSlip.driverName,
+      notes: loadSlip.notes || null,
+      items: (loadSlip.items || []).map((item, idx) => {
+        const hub = locations.find(l => l.id === item.locationId);
+        return {
+          idempotency_key: `${loadSlip.idempotencyKey}-item-${idx + 1}`,
+          customer_id: isUUID(item.customerId) ? item.customerId : null,
+          customer_name: item.storeName.trim(),
+          hub_id: isUUID(item.locationId) ? item.locationId : null,
+          hub_name: hub?.name || item.locationName || "Cagayan de Oro Hub",
+          product_id: isUUID(item.iceProductId) ? item.iceProductId : null,
+          product_name: item.iceType,
+          sack_size: item.sackSize || "Standard Sack",
+          planned_qty: Number(item.plannedQty) || 0,
+          unit_price: roundCurrency(item.unitPrice),
+          total_amount: roundCurrency(item.totalPrice),
+          payment_mode: item.paymentType === "Charge Invoice" ? "Charge" : "Cash"
+        };
+      })
+    };
 
-    // Idempotency check
-    const existingIndex = existingHistory.findIndex(ls =>
-      ls.idempotencyKey === loadSlip.idempotencyKey || ls.id === loadSlip.id
-    );
+    try {
+      const res = await this.authorizedFetch(`${BACKEND_URL}/api/v1/load-slips`, {
+        method: "POST",
+        body: JSON.stringify(body)
+      });
+      const json = await res.json().catch(() => ({}));
 
-    let updatedHistory: LoadSlip[];
-    if (existingIndex >= 0) {
-      updatedHistory = [...existingHistory];
-      updatedHistory[existingIndex] = { ...loadSlip, updatedAt: new Date().toISOString() };
-    } else {
-      updatedHistory = [{ ...loadSlip, updatedAt: new Date().toISOString() }, ...existingHistory];
+      if (!res.ok) {
+        return {
+          success: false,
+          statusCode: res.status,
+          message: json.detail || "Unable to dispatch Load Slip."
+        };
+      }
+
+      const savedMapped = json.data ? mapDbSlipToWeb(json.data) : { ...loadSlip, status: "DISPATCHED" as const };
+      const existing = this.getHistoricalLoadSlips().filter(s => s.id !== savedMapped.id && s.idempotencyKey !== savedMapped.idempotencyKey);
+      setStorageItem(STORAGE_KEYS.LOAD_SLIPS, [savedMapped, ...existing]);
+
+      return {
+        success: true,
+        message: json.message || `Load Slip #${savedMapped.slipNumber || savedMapped.id} dispatched successfully!`,
+        loadSlip: savedMapped,
+        remainingCapacity: json.remaining_capacity,
+        inTransitWarning: json.in_transit_warning
+      };
+    } catch (err: any) {
+      return {
+        success: false,
+        message: err?.message || "Network error contacting dispatch server. Ensure you are online to prevent concurrent overbooking."
+      };
+    }
+  }
+
+  static async saveLoadSlip(loadSlip: LoadSlip) {
+    return this.dispatchLoadSlip(loadSlip);
+  }
+
+  static async fetchPendingShiftClosings(): Promise<{
+    slips: LoadSlip[];
+    inTransitCount: number;
+  }> {
+    try {
+      const res = await this.authorizedFetch(`${BACKEND_URL}/api/v1/shift-closing/pending`);
+      if (res.ok) {
+        const json = await res.json();
+        const slips = (json.data || []).map((s: any) => mapDbSlipToWeb(s));
+        return {
+          slips,
+          inTransitCount: Number(json.in_transit_count || 0)
+        };
+      }
+    } catch {
+      // Fallback directly to Supabase filtering strictly DELIVERY_FINISHED / AWAITING_REMIT
     }
 
-    setStorageItem(STORAGE_KEYS.LOAD_SLIPS, updatedHistory);
+    const { data, error } = await supabase
+      .from("load_slips")
+      .select("*, load_slip_items(*, delivery_hubs(name)), trucks(plate_number, model)")
+      .is("deleted_at", null)
+      .order("created_at", { ascending: false });
 
-    // Sync to Supabase in background
-    (async () => {
-      try {
-        const isUUID = (val: string) => /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i.test(val);
+    if (error || !data) {
+      return { slips: [], inTransitCount: 0 };
+    }
 
-        // 1. Insert/Upsert Load Slip
-        const { data: insertedSlip, error: slipErr } = await supabase
-          .from("load_slips")
-          .upsert({
-            slip_number: loadSlip.id,
-            idempotency_key: loadSlip.idempotencyKey || generateUUID(),
-            date: loadSlip.date,
-            departure_time: loadSlip.time || "06:00",
-            truck_id: loadSlip.truckId,
-            in_charge_id: isUUID(loadSlip.inChargeId) ? loadSlip.inChargeId : null,
-            driver_id: isUUID(loadSlip.driverId) ? loadSlip.driverId : null,
-            status: loadSlip.status === "Draft" ? "Pending" : "In-Transit",
-            total_loaded_sacks: loadSlip.totalLoadedSacks || 0,
-            total_delivered_sacks: loadSlip.totalDeliveredSacks || 0,
-            total_returned_sacks: loadSlip.totalReturnedSacks || 0,
-            total_cash_revenue: loadSlip.totalCashRevenue || 0,
-            total_charge_revenue: loadSlip.totalChargeRevenue || 0,
-            created_by: loadSlip.inChargeName || "Admin Dispatcher"
-          }, { onConflict: "slip_number" })
-          .select("id")
-          .single();
+    const finishedStatuses = new Set(["DELIVERY_FINISHED", "AWAITING_REMIT", "COMPLETED / PENDING REMITTANCE"]);
+    const inTransitStatuses = new Set(["DISPATCHED", "ACTIVE", "PENDING", "IN_TRANSIT", "IN-TRANSIT"]);
 
-        if (slipErr) {
-          console.warn("Supabase load_slip upsert note:", slipErr.message);
-        }
-
-        const slipDbId = insertedSlip?.id;
-
-        // 2. Insert items and invoices if items exist
-        if (loadSlip.items && loadSlip.items.length > 0) {
-          const invoicesToInsert = [];
-          for (let i = 0; i < loadSlip.items.length; i++) {
-            const item = loadSlip.items[i];
-            const invNumber = `INV-${loadSlip.date.replace(/-/g, "")}-${(i + 1).toString().padStart(3, "0")}`;
-            invoicesToInsert.push({
-              invoice_number: invNumber,
-              idempotency_key: item.id || generateUUID(),
-              load_slip_id: slipDbId || null,
-              customer_name: item.storeName || "Customer Store",
-              hub_name: item.locationName || "Cagayan de Oro Hub",
-              product_name: item.iceType || "Tube Ice (50kg)",
-              delivered_qty: item.plannedQty || 1,
-              unit_price: item.unitPrice || 150,
-              total_amount: item.totalPrice || 150,
-              payment_type: item.paymentType === "Charge Invoice" ? "Charge" : "Cash",
-              status: item.paymentType === "Charge Invoice" ? "Unpaid Charge" : "Cash Paid",
-              issue_date: loadSlip.date
-            });
-          }
-
-          if (invoicesToInsert.length > 0) {
-            supabase.from("invoices").upsert(invoicesToInsert, { onConflict: "invoice_number" }).then(({ error }) => {
-              if (error) console.warn("Supabase invoices upsert note:", error.message);
-            });
-          }
-        }
-      } catch (err: any) {
-        console.warn("Error syncing load slip to Supabase:", err.message);
-      }
-    })();
+    const finished = data.filter((r: any) => finishedStatuses.has(String(r.status || "").toUpperCase()));
+    const inTransitCount = data.filter((r: any) => inTransitStatuses.has(String(r.status || "").toUpperCase())).length;
 
     return {
-      success: true,
-      message: `Load Slip #${loadSlip.id} saved successfully!`,
-      loadSlip
+      slips: finished.map((s: any) => mapDbSlipToWeb(s)),
+      inTransitCount
     };
+  }
+
+  static async confirmShiftRemit(slipId: string, notes?: string): Promise<{ success: boolean; message: string }> {
+    try {
+      const res = await this.authorizedFetch(`${BACKEND_URL}/api/v1/load-slips/${encodeURIComponent(slipId)}/confirm-remit`, {
+        method: "POST",
+        body: JSON.stringify({
+          notes: notes || null,
+          closed_at: getManilaTimeString()
+        })
+      });
+      const json = await res.json().catch(() => ({}));
+      if (res.ok) {
+        await this.fetchLiveFromSupabase();
+        return { success: true, message: json.message || "Shift confirmed & remitted!" };
+      }
+      return { success: false, message: json.detail || "Failed to confirm shift closing." };
+    } catch (err: any) {
+      return { success: false, message: err?.message || "Network error confirming shift remit." };
+    }
   }
 
   // --- LIVE TELEMETRY & SOS ---
   static getLiveTelemetry(): LiveTruckTelemetry[] {
-    return getStorageItem<LiveTruckTelemetry[]>(STORAGE_KEYS.TELEMETRY, INITIAL_TELEMETRY);
+    return getStorageItem<LiveTruckTelemetry[]>(STORAGE_KEYS.TELEMETRY, []);
+  }
+
+  static async fetchLiveTelemetry(): Promise<LiveTruckTelemetry[]> {
+    try {
+      const res = await this.authorizedFetch(`${BACKEND_URL}/api/v1/telemetry/live`);
+      if (res.ok) {
+        const json = await res.json();
+        const list = (json.data || []) as LiveTruckTelemetry[];
+        setStorageItem(STORAGE_KEYS.TELEMETRY, list);
+        return list;
+      }
+    } catch {
+      // Fallback
+    }
+    return this.getLiveTelemetry();
   }
 
   static dispatchRescue(truckId: string): void {
@@ -1016,10 +1305,7 @@ export class DataService {
       if (t.truckId === truckId && t.sosAlert) {
         return {
           ...t,
-          sosAlert: {
-            ...t.sosAlert,
-            dispatchedRescue: true
-          }
+          sosAlert: { ...t.sosAlert, dispatchedRescue: true }
         };
       }
       return t;
@@ -1027,7 +1313,7 @@ export class DataService {
     setStorageItem(STORAGE_KEYS.TELEMETRY, telemetry);
   }
 
-  // --- DATA STRUCTURES & ALGORITHMS (DSA) FOR HISTORY SEARCH & FILTERING ---
+  // --- HISTORY SEARCH & FILTERING ---
   static filterAndSortHistory({
     history,
     searchQuery,
@@ -1042,136 +1328,128 @@ export class DataService {
     yearFilter?: string;
     monthFilter?: string;
     paymentStatusFilter: "ALL" | "Cash" | "Charge Invoice" | "Partial" | "Completed";
-  }): {
-    results: LoadSlip[];
-    kpi: {
-      totalSacksLoaded: number;
-      totalSacksDelivered: number;
-      totalSacksReturned: number;
-      totalRevenue: number;
-      totalCash: number;
-      totalCharge: number;
-      totalSlips: number;
-    }
-  } {
+  }) {
     const safeHistory = Array.isArray(history) ? history : [];
     const normalizedQuery = (searchQuery || "").trim().toLowerCase();
 
-    // 1. Filter phase (O(N) single pass over dataset)
     const filtered = safeHistory.filter(slip => {
       if (!slip) return false;
-      // Date components
       const [year, month] = (slip.date || "").split("-");
       if (yearFilter && yearFilter !== "ALL" && year !== yearFilter) return false;
       if (monthFilter && monthFilter !== "ALL" && month !== monthFilter) return false;
 
-      // Payment Status filter
       if (paymentStatusFilter !== "ALL") {
         if (paymentStatusFilter === "Cash" && (slip.totalCashRevenue || 0) <= 0) return false;
         if (paymentStatusFilter === "Charge Invoice" && (slip.totalChargeRevenue || 0) <= 0) return false;
-        if (paymentStatusFilter === "Completed" && slip.status !== "Completed") return false;
+        const stUpper = String(slip.status || "").toUpperCase();
+        if (paymentStatusFilter === "Completed" && !["REMITTED", "COMPLETED", "RECONCILED"].includes(stUpper)) return false;
         if (paymentStatusFilter === "Partial") {
           const hasPartial = (slip.items || []).some(i => i && i.status === "Partial") || (slip.totalReturnedSacks || 0) > 0;
           if (!hasPartial) return false;
         }
       }
 
-      // Debounced search query across Store Name, Driver Name, or Truck Number
       if (normalizedQuery) {
         const matchesDriver = (slip.driverName || "").toLowerCase().includes(normalizedQuery);
-        const matchesTruck = (slip.truckPlate || "").toLowerCase().includes(normalizedQuery) ||
+        const matchesTruck =
+          (slip.truckPlate || "").toLowerCase().includes(normalizedQuery) ||
           (slip.truckId || "").toLowerCase().includes(normalizedQuery);
         const matchesStore = (slip.items || []).some(item => item && (item.storeName || "").toLowerCase().includes(normalizedQuery));
-        const matchesId = (slip.id || "").toLowerCase().includes(normalizedQuery);
+        const matchesId =
+          (slip.id || "").toLowerCase().includes(normalizedQuery) ||
+          (slip.slipNumber || "").toLowerCase().includes(normalizedQuery);
         if (!matchesDriver && !matchesTruck && !matchesStore && !matchesId) return false;
       }
 
       return true;
     });
 
-    // 2. Sorting phase (O(N log N))
     const sorted = [...filtered].sort((a, b) => {
       const timeA = new Date(`${a.date}T${a.time || "00:00"}`).getTime();
       const timeB = new Date(`${b.date}T${b.time || "00:00"}`).getTime();
       return sortOrder === "latest" ? timeB - timeA : timeA - timeB;
     });
 
-    // 3. KPI Aggregation (O(N) accumulator)
-    const kpi = sorted.reduce(
-      (acc, slip) => {
-        acc.totalSacksLoaded += slip.totalLoadedSacks || 0;
-        acc.totalSacksDelivered += slip.totalDeliveredSacks || 0;
-        acc.totalSacksReturned += slip.totalReturnedSacks || 0;
-        acc.totalRevenue += slip.totalRevenue || 0;
-        acc.totalCash += slip.totalCashRevenue || 0;
-        acc.totalCharge += slip.totalChargeRevenue || 0;
-        acc.totalSlips += 1;
-        return acc;
-      },
-      {
-        totalSacksLoaded: 0,
-        totalSacksDelivered: 0,
-        totalSacksReturned: 0,
-        totalRevenue: 0,
-        totalCash: 0,
-        totalCharge: 0,
-        totalSlips: 0
-      }
-    );
+    const kpi = {
+      totalSacksLoaded: sorted.reduce((acc, s) => acc + (s.totalLoadedSacks || 0), 0),
+      totalSacksDelivered: sorted.reduce((acc, s) => acc + (s.totalDeliveredSacks || 0), 0),
+      totalSacksReturned: sorted.reduce((acc, s) => acc + (s.totalReturnedSacks || 0), 0),
+      totalRevenue: sumCurrency(sorted.map(s => s.totalRevenue || 0)),
+      totalCash: sumCurrency(sorted.map(s => s.totalCashRevenue || 0)),
+      totalCharge: sumCurrency(sorted.map(s => s.totalChargeRevenue || 0)),
+      totalSlips: sorted.length
+    };
 
     return { results: sorted, kpi };
   }
 
-  // --- BILLING & CREDIT COLLECTIONS LEDGER ---
+  // --- INVOICES & COLLECTIONS LEDGER ---
   static getInvoices(): InvoiceRecord[] {
-    const invs = getStorageItem<InvoiceRecord[]>(STORAGE_KEYS.INVOICES, INITIAL_INVOICES);
+    const invs = getStorageItem<InvoiceRecord[]>(STORAGE_KEYS.INVOICES, []);
     return Array.isArray(invs) ? invs : [];
   }
 
-  static settleChargeInvoice(
+  static async fetchInvoicesLive(): Promise<InvoiceRecord[]> {
+    try {
+      const res = await this.authorizedFetch(`${BACKEND_URL}/api/v1/invoices`);
+      if (res.ok) {
+        const json = await res.json();
+        const mapped = (json.data || []).map(mapDbInvoiceToWeb);
+        setStorageItem(STORAGE_KEYS.INVOICES, mapped);
+        return mapped;
+      }
+    } catch {
+      // fallback below
+    }
+
+    const { data, error } = await supabase
+      .from("invoices")
+      .select("*, load_slips(slip_number, truck_id, truck_plate, driver_name, in_charge_name, status)")
+      .is("deleted_at", null)
+      .order("created_at", { ascending: false });
+
+    if (!error && data) {
+      const mapped = data.map(mapDbInvoiceToWeb);
+      setStorageItem(STORAGE_KEYS.INVOICES, mapped);
+      return mapped;
+    }
+
+    return this.getInvoices();
+  }
+
+  static async settleChargeInvoice(
     invoiceId: string,
-    staffName: string = "Rochill Libron (Staff)"
-  ): { success: boolean; message: string; invoice?: InvoiceRecord } {
-    const invoices = this.getInvoices();
-    const index = invoices.findIndex(i => i.id === invoiceId);
-    if (index < 0) {
-      return { success: false, message: "Invoice not found." };
+    staffName?: string
+  ): Promise<{ success: boolean; message: string; invoice?: InvoiceRecord }> {
+    const currentActor = staffName || this.getCurrentUser()?.name || "Staff";
+    try {
+      const res = await this.authorizedFetch(`${BACKEND_URL}/api/v1/invoices/${encodeURIComponent(invoiceId)}/settle`, {
+        method: "POST"
+      });
+      const json = await res.json().catch(() => ({}));
+      if (res.ok) {
+        await this.fetchInvoicesLive();
+        return {
+          success: true,
+          message: json.message || "Invoice marked as settled!",
+          invoice: json.data ? mapDbInvoiceToWeb(json.data) : undefined
+        };
+      }
+      return { success: false, message: json.detail || "Unable to settle invoice." };
+    } catch {
+      const now = new Date();
+      const { error } = await supabase
+        .from("invoices")
+        .update({
+          status: "Settled",
+          settled_at: now.toISOString(),
+          settled_by: currentActor
+        })
+        .eq("id", invoiceId);
+      if (error) return { success: false, message: error.message };
+      await this.fetchInvoicesLive();
+      return { success: true, message: "Invoice marked as PAID / SETTLED." };
     }
-
-    const current = invoices[index];
-    if (current.status === "Settled Charge") {
-      return { success: false, message: "Invoice is already marked as settled." };
-    }
-
-    const now = new Date();
-    // Normalized to Asia/Manila format
-    const settledTime = `${now.toLocaleDateString("en-CA")} ${now.toLocaleTimeString("en-US", { hour: "2-digit", minute: "2-digit" })}`;
-
-    const updated: InvoiceRecord = {
-      ...current,
-      status: "Settled Charge",
-      settledAt: settledTime,
-      settledBy: staffName
-    };
-
-    const updatedList = [...invoices];
-    updatedList[index] = updated;
-    setStorageItem(STORAGE_KEYS.INVOICES, updatedList);
-
-    // Sync to Supabase
-    supabase.from("invoices").update({
-      status: "Settled",
-      settled_at: now.toISOString(),
-      settled_by: staffName
-    }).eq("id", invoiceId).then(({ error }) => {
-      if (error) console.error("Error updating invoice in Supabase:", error);
-    });
-
-    return {
-      success: true,
-      message: `Invoice ${current.invoiceNumber} for ${current.customerName} successfully marked as PAID / SETTLED.`,
-      invoice: updated
-    };
   }
 
   static filterAndSortInvoices({
@@ -1187,23 +1465,11 @@ export class DataService {
     sortOrder: "latest" | "oldest";
     yearFilter?: string;
     monthFilter?: string;
-    statusFilter: "ALL" | "Cash Paid" | "Unpaid Charge" | "Settled Charge";
-  }): {
-    results: InvoiceRecord[];
-    kpi: {
-      totalCashCollected: number;
-      totalUnpaidCharge: number;
-      totalSettledCharge: number;
-      totalOverall: number;
-      countUnpaid: number;
-      countSettled: number;
-      countCash: number;
-    }
-  } {
+    statusFilter: "ALL" | "Pending Delivery" | "Cash Paid" | "Unpaid Charge" | "Settled Charge";
+  }) {
     const safeInvoices = Array.isArray(invoices) ? invoices : [];
     const normalizedQuery = (searchQuery || "").trim().toLowerCase();
 
-    // 1. Filter phase
     const filtered = safeInvoices.filter(inv => {
       if (!inv) return false;
       const parts = (inv.date || "").split("-");
@@ -1211,61 +1477,71 @@ export class DataService {
       const month = parts[1] || "";
       if (yearFilter && yearFilter !== "ALL" && year !== yearFilter) return false;
       if (monthFilter && monthFilter !== "ALL" && month !== monthFilter) return false;
-
       if (statusFilter !== "ALL" && inv.status !== statusFilter) return false;
 
       if (normalizedQuery) {
         const matchCust = (inv.customerName || "").toLowerCase().includes(normalizedQuery);
         const matchLoc = (inv.locationName || "").toLowerCase().includes(normalizedQuery);
         const matchInv = (inv.invoiceNumber || "").toLowerCase().includes(normalizedQuery);
-        if (!matchCust && !matchLoc && !matchInv) return false;
+        const matchSlip = (inv.slipNumber || "").toLowerCase().includes(normalizedQuery);
+        const matchDriver = (inv.driverName || "").toLowerCase().includes(normalizedQuery);
+        if (!matchCust && !matchLoc && !matchInv && !matchSlip && !matchDriver) return false;
       }
 
       return true;
     });
 
-    // 2. Sort phase
     const sorted = [...filtered].sort((a, b) => {
-      const timeA = new Date(a.date || 0).getTime();
-      const timeB = new Date(b.date || 0).getTime();
+      const timeA = new Date(a.issuedAt || a.date || 0).getTime();
+      const timeB = new Date(b.issuedAt || b.date || 0).getTime();
       return sortOrder === "latest" ? timeB - timeA : timeA - timeB;
     });
 
-    // 3. KPI Aggregation
-    const kpi = safeInvoices.reduce(
-      (acc, inv) => {
-        if (!inv) return acc;
-        const amt = Number(inv.totalAmount) || 0;
-        if (inv.status === "Cash Paid") {
-          acc.totalCashCollected += amt;
-          acc.countCash += 1;
-        } else if (inv.status === "Unpaid Charge") {
-          acc.totalUnpaidCharge += amt;
-          acc.countUnpaid += 1;
-        } else if (inv.status === "Settled Charge") {
-          acc.totalSettledCharge += amt;
-          // Settled charge is also collected cash!
-          acc.totalCashCollected += amt;
-          acc.countSettled += 1;
-        }
-        acc.totalOverall += amt;
-        return acc;
-      },
-      {
-        totalCashCollected: 0,
-        totalUnpaidCharge: 0,
-        totalSettledCharge: 0,
-        totalOverall: 0,
-        countUnpaid: 0,
-        countSettled: 0,
-        countCash: 0
-      }
-    );
+    let totalCashCents = 0;
+    let totalUnpaidCents = 0;
+    let totalSettledCents = 0;
+    let totalPendingCents = 0;
+    let countCash = 0;
+    let countUnpaid = 0;
+    let countSettled = 0;
+    let countPending = 0;
 
-    return { results: sorted, kpi };
+    for (const inv of safeInvoices) {
+      if (!inv) continue;
+      const cents = Math.round(roundCurrency(inv.totalAmount) * 100);
+      if (inv.status === "Cash Paid") {
+        totalCashCents += cents;
+        countCash += 1;
+      } else if (inv.status === "Unpaid Charge") {
+        totalUnpaidCents += cents;
+        countUnpaid += 1;
+      } else if (inv.status === "Settled Charge") {
+        totalSettledCents += cents;
+        totalCashCents += cents;
+        countSettled += 1;
+      } else {
+        totalPendingCents += cents;
+        countPending += 1;
+      }
+    }
+
+    return {
+      results: sorted,
+      kpi: {
+        totalCashCollected: totalCashCents / 100,
+        totalUnpaidCharge: totalUnpaidCents / 100,
+        totalSettledCharge: totalSettledCents / 100,
+        totalPendingDelivery: totalPendingCents / 100,
+        totalOverall: (totalCashCents + totalUnpaidCents + totalPendingCents) / 100,
+        countUnpaid,
+        countSettled,
+        countCash,
+        countPending
+      }
+    };
   }
 
-  // --- SHIFT RECONCILIATION ---
+  // --- SHIFT RECONCILIATION ARCHIVE ---
   static getReconciliations(): any[] {
     return getStorageItem<any[]>(STORAGE_KEYS.RECONCILIATIONS, []);
   }
@@ -1273,19 +1549,5 @@ export class DataService {
   static saveReconciliation(record: any): void {
     const list = this.getReconciliations();
     setStorageItem(STORAGE_KEYS.RECONCILIATIONS, [record, ...list]);
-
-    // Sync to Supabase
-    supabase.from("shift_reconciliations").insert({
-      truck_id: record.truckId,
-      reconciliation_date: record.date || new Date().toISOString().split("T")[0],
-      cash_remitted: record.cashRemitted || 0,
-      charge_issued: record.chargeIssued || 0,
-      sacks_returned: record.sacksReturned || 0,
-      closed_at: record.closedAt || "18:00",
-      closed_by: record.closedBy || "Staff",
-      notes: record.notes || null
-    }).then(({ error }) => {
-      if (error) console.error("Error inserting reconciliation into Supabase:", error);
-    });
   }
 }

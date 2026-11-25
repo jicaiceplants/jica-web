@@ -1,202 +1,264 @@
 "use client";
 
-import { useState, useEffect } from "react";
-import { AlertTriangle, MapPin, Navigation, Truck, AlertOctagon, CheckCircle2, ShieldAlert } from "lucide-react";
-import dynamic from "next/dynamic";
-import { LiveTruckTelemetry } from "@/lib/types";
+import React, { useState, useEffect, useCallback } from "react";
 import { DataService } from "@/lib/dataService";
+import { supabase } from "@/lib/supabaseClient";
+import { LiveFleetMap } from "@/components/LiveFleetMap";
+import { LiveTruckTelemetry, DeliveryLocation } from "@/lib/types";
+import { formatManilaDateTime } from "@/lib/dateUtils";
+import {
+  Navigation,
+  Truck,
+  Siren,
+  RefreshCw,
+  CheckCircle2,
+  AlertTriangle,
+  Package,
+  Gauge
+} from "lucide-react";
 
-const MapComponent = dynamic(() => import("./LiveFleetMap"), { ssr: false });
+const BACKEND_URL = (process.env.NEXT_PUBLIC_BACKEND_URL || "https://jica-backend-production.up.railway.app")
+  .replace(/\/+$/, "")
+  .trim();
 
-export default function LiveFleetTracking() {
+export function LiveFleetTracking() {
   const [telemetry, setTelemetry] = useState<LiveTruckTelemetry[]>([]);
-  const [activeSos, setActiveSos] = useState<LiveTruckTelemetry | null>(null);
+  const [locations, setLocations] = useState<DeliveryLocation[]>([]);
+  const [selectedTruckId, setSelectedTruckId] = useState<string>("");
+  const [isLoading, setIsLoading] = useState(true);
+  const [isRefreshing, setIsRefreshing] = useState(false);
+  const [banner, setBanner] = useState<{ type: "success" | "error"; text: string } | null>(null);
 
-  useEffect(() => {
-    const list = DataService.getLiveTelemetry();
-    setTelemetry(list);
-    const alertTruck = list.find(t => t.sosAlert && t.sosAlert.active);
-    setActiveSos(alertTruck || null);
+  const loadLiveFleet = useCallback(async (showSpinner = false) => {
+    if (showSpinner) setIsRefreshing(true);
+    try {
+      const [liveTel] = await Promise.all([
+        DataService.fetchLiveTelemetry(),
+        DataService.fetchLiveFromSupabase()
+      ]);
+      setTelemetry(liveTel);
+      setLocations(DataService.getLocations());
+    } finally {
+      setIsLoading(false);
+      setIsRefreshing(false);
+    }
   }, []);
 
-  const handleDispatchRescue = (truckId: string) => {
-    DataService.dispatchRescue(truckId);
-    const updated = DataService.getLiveTelemetry();
-    setTelemetry(updated);
-    const alertTruck = updated.find(t => t.sosAlert && t.sosAlert.active);
-    setActiveSos(alertTruck || null);
-    alert(`Rescue vehicle dispatched to ${truckId} near Lapasan Highway! Driver notified.`);
+  useEffect(() => {
+    setLocations(DataService.getLocations());
+    loadLiveFleet(false);
+
+    const channel = supabase
+      .channel("live-fleet-realtime")
+      .on("postgres_changes", { event: "*", schema: "public", table: "gps_logs" }, () => {
+        loadLiveFleet(false);
+      })
+      .on("postgres_changes", { event: "*", schema: "public", table: "sos_alerts" }, () => {
+        loadLiveFleet(false);
+      })
+      .on("postgres_changes", { event: "*", schema: "public", table: "load_slips" }, () => {
+        loadLiveFleet(false);
+      })
+      .subscribe();
+
+    const poll = setInterval(() => loadLiveFleet(false), 5000);
+    return () => {
+      clearInterval(poll);
+      supabase.removeChannel(channel);
+    };
+  }, [loadLiveFleet]);
+
+  const handleDispatchRescue = async (truck: LiveTruckTelemetry) => {
+    setBanner(null);
+    DataService.dispatchRescue(truck.truckId);
+
+    try {
+      const currentUser = DataService.getCurrentUser();
+      let alertId = "";
+      const activeRes = await fetch(`${BACKEND_URL}/api/v1/telemetry/sos/active`);
+      if (activeRes.ok) {
+        const activeData = await activeRes.json();
+        const match = (activeData.alerts || []).find(
+          (a: any) => a.truck_id === truck.truckId && a.status === "Active"
+        );
+        if (match?.id) alertId = match.id;
+      }
+
+      if (alertId) {
+        await fetch(`${BACKEND_URL}/api/v1/telemetry/sos/acknowledge`, {
+          method: "POST",
+          headers: DataService.getAuthHeaders(),
+          body: JSON.stringify({
+            alert_id: alertId,
+            acknowledged_by: currentUser?.name || "Dispatch Desk",
+            dispatcher_reply: "Rescue unit dispatched immediately from Live Fleet Control."
+          })
+        });
+      }
+    } catch {
+      // Non-fatal fallback
+    }
+
+    setBanner({
+      type: "success",
+      text: `Rescue acknowledgment sent for ${truck.truckId} (${truck.driverName}).`
+    });
+    await loadLiveFleet(false);
   };
 
   return (
-    <div className="flex flex-col gap-6 h-full min-h-[850px] pb-12">
-      {/* Emergency Alert Center Banner */}
-      {activeSos && (
-        <section className={`border-l-4 p-6 rounded-2xl flex flex-col md:flex-row justify-between items-start md:items-center gap-4 shadow-md transition-all ${
-          activeSos.sosAlert?.dispatchedRescue
-            ? "bg-amber-50 dark:bg-amber-950/20 border-amber-500 text-amber-900 dark:text-amber-200"
-            : "bg-red-50 dark:bg-red-950/30 border-red-500 text-red-900 dark:text-red-200 animate-pulse"
-        }`}>
-          <div className="flex items-start md:items-center gap-4">
-            <div className={`p-3 rounded-full shrink-0 ${
-              activeSos.sosAlert?.dispatchedRescue
-                ? "bg-amber-100 dark:bg-amber-900/50 text-amber-600"
-                : "bg-red-100 dark:bg-red-900/60 text-red-600"
-            }`}>
-              <AlertTriangle className="w-7 h-7" />
-            </div>
-            <div>
-              <div className="flex items-center gap-3 mb-1">
-                <h2 className="text-lg font-black tracking-tight">Emergency Roadside Alert Center</h2>
-                <span className={`text-xs font-bold px-2.5 py-0.5 rounded-full ${
-                  activeSos.sosAlert?.dispatchedRescue
-                    ? "bg-amber-600 text-white"
-                    : "bg-red-600 text-white"
-                }`}>
-                  {activeSos.sosAlert?.dispatchedRescue ? "Rescue Dispatched" : "1 Breakdown Active"}
-                </span>
-              </div>
-              <p className="text-sm font-medium">
-                <strong>{activeSos.truckId} ({activeSos.truckPlate}) - Driver {activeSos.driverName}:</strong>{" "}
-                {activeSos.sosAlert?.reason} at {activeSos.currentLocationName}.
-              </p>
-            </div>
-          </div>
+    <div className="space-y-6">
+      <div className="bg-white dark:bg-slate-800 rounded-2xl border border-slate-200 dark:border-slate-700 p-5 flex flex-col sm:flex-row sm:items-center justify-between gap-4 shadow-xs">
+        <div>
+          <h2 className="text-lg font-black text-slate-900 dark:text-white flex items-center gap-2">
+            <Navigation className="w-5 h-5 text-emerald-600" />
+            <span>Live Fleet GPS Corridor</span>
+          </h2>
+          <p className="text-xs text-slate-500 dark:text-slate-400 mt-0.5">
+            Real-time truck coordinates, sack delivery progress, and active breakdown alerts
+          </p>
+        </div>
 
-          <div className="flex items-center gap-3 self-end md:self-auto">
-            {activeSos.sosAlert?.dispatchedRescue ? (
-              <span className="flex items-center gap-1.5 font-bold text-xs bg-amber-200/60 dark:bg-amber-900/50 px-4 py-2 rounded-xl">
-                <CheckCircle2 className="w-4 h-4 text-emerald-600" />
-                Help en route to Lapasan
-              </span>
-            ) : (
-              <button
-                onClick={() => handleDispatchRescue(activeSos.truckId)}
-                className="bg-red-600 hover:bg-red-700 text-white font-extrabold py-2.5 px-7 rounded-xl shadow-lg hover:shadow-xl transition-all text-sm shrink-0"
-              >
-                Dispatch Rescue Team
-              </button>
-            )}
-          </div>
-        </section>
+        <button
+          type="button"
+          onClick={() => loadLiveFleet(true)}
+          disabled={isRefreshing}
+          className="min-h-[44px] px-4 py-2.5 bg-slate-100 hover:bg-slate-200 dark:bg-slate-700 dark:hover:bg-slate-600 text-slate-700 dark:text-slate-200 rounded-xl text-xs font-bold flex items-center gap-2 cursor-pointer"
+        >
+          <RefreshCw className={`w-4 h-4 ${isRefreshing ? "animate-spin" : ""}`} />
+          <span>Refresh Positions</span>
+        </button>
+      </div>
+
+      {banner && (
+        <div
+          className={`p-4 rounded-2xl border text-xs font-bold flex items-center gap-2 ${
+            banner.type === "success"
+              ? "bg-emerald-50 dark:bg-emerald-950/40 border-emerald-200 dark:border-emerald-800 text-emerald-800 dark:text-emerald-200"
+              : "bg-red-50 dark:bg-red-950/40 border-red-200 dark:border-red-800 text-red-700 dark:text-red-300"
+          }`}
+        >
+          {banner.type === "success" ? (
+            <CheckCircle2 className="w-4 h-4 shrink-0" />
+          ) : (
+            <AlertTriangle className="w-4 h-4 shrink-0" />
+          )}
+          <span>{banner.text}</span>
+        </div>
       )}
 
-      {/* Main Tracking Area */}
-      <section className="flex flex-col xl:flex-row gap-6 flex-1 h-auto xl:h-[650px]">
-        {/* Map Container */}
-        <div className="flex-1 bg-white dark:bg-slate-800 border border-slate-200 dark:border-slate-700 rounded-3xl shadow-sm overflow-hidden relative h-[500px] xl:h-full w-full">
-          {/* Overlay Map Badge */}
-          <div className="absolute top-4 left-4 bg-white/95 dark:bg-slate-800/95 backdrop-blur-md px-4 py-2.5 rounded-2xl shadow-lg border border-slate-200 dark:border-slate-700 z-[1000]">
-            <div className="flex items-center gap-2">
-              <span className="w-2.5 h-2.5 rounded-full bg-emerald-500 animate-ping" />
-              <h3 className="font-extrabold text-slate-900 dark:text-white text-sm">Active Fleet Route Monitoring</h3>
+      <div className="grid grid-cols-1 lg:grid-cols-12 gap-6">
+        <div className="lg:col-span-8">
+          <LiveFleetMap
+            telemetry={telemetry}
+            locations={locations}
+            selectedTruckId={selectedTruckId}
+            onSelectTruck={setSelectedTruckId}
+          />
+        </div>
+
+        <div className="lg:col-span-4 space-y-3">
+          <div className="text-xs font-bold uppercase tracking-wider text-slate-500 dark:text-slate-400 px-1">
+            Active Fleet Vehicles ({telemetry.length})
+          </div>
+
+          {isLoading ? (
+            <div className="bg-white dark:bg-slate-800 rounded-2xl border border-slate-200 dark:border-slate-700 p-6 text-center text-xs text-slate-500">
+              Loading live fleet telemetry...
             </div>
-            <p className="text-[11px] text-slate-500 mt-0.5">Live GPS & Sack Delivery Tracking</p>
-          </div>
+          ) : telemetry.length === 0 ? (
+            <div className="bg-white dark:bg-slate-800 rounded-2xl border border-slate-200 dark:border-slate-700 p-6 text-center text-xs text-slate-500 dark:text-slate-400">
+              No fleet telemetry active right now. Dispatch a Load Slip to track vehicles live.
+            </div>
+          ) : (
+            <div className="space-y-3 max-h-[460px] overflow-y-auto scroll-touch pr-1">
+              {telemetry.map(trk => {
+                const isSelected = selectedTruckId === trk.truckId;
+                const isAlert = trk.status === "Alert" || Boolean(trk.sosAlert?.active);
 
-          <MapComponent />
-        </div>
-
-        {/* Live Driver Progress Monitor Side Panel */}
-        <div className="w-full xl:w-[420px] bg-white dark:bg-slate-800 border border-slate-200 dark:border-slate-700 shadow-sm rounded-3xl overflow-hidden flex flex-col shrink-0">
-          <div className="p-6 border-b border-slate-200 dark:border-slate-700">
-            <h2 className="text-xl font-black text-slate-900 dark:text-white">Active Driver Progress</h2>
-            <p className="text-slate-500 text-xs mt-1">
-              Live sack inventory reconciliation and stop progress.
-            </p>
-          </div>
-
-          <div className="p-4 space-y-4 overflow-y-auto flex-1 bg-slate-50/50 dark:bg-slate-900/30">
-            {telemetry.map((t) => {
-              const fulfillmentPct = t.totalStops > 0 ? Math.round((t.completedStops / t.totalStops) * 100) : 0;
-
-              return (
-                <div
-                  key={t.truckId}
-                  className={`bg-white dark:bg-slate-800 border-2 rounded-2xl p-4 shadow-sm transition-all ${
-                    t.status === "Alert"
-                      ? "border-red-300 dark:border-red-800/60 bg-red-50/30"
-                      : "border-slate-200 dark:border-slate-700"
-                  }`}
-                >
-                  {/* Truck & Driver Row */}
-                  <div className="flex justify-between items-start mb-3">
-                    <div className="flex items-center gap-3">
-                      <div className={`p-2.5 rounded-xl font-bold ${
-                        t.status === "Alert"
-                          ? "bg-red-100 text-red-600"
-                          : t.status === "Delivering"
-                          ? "bg-blue-100 text-blue-600"
-                          : "bg-amber-100 text-amber-600"
-                      }`}>
-                        <Truck className="w-5 h-5" />
+                return (
+                  <div
+                    key={trk.truckId}
+                    onClick={() => setSelectedTruckId(trk.truckId)}
+                    className={`p-4 rounded-2xl border transition-all cursor-pointer ${
+                      isAlert
+                        ? "bg-red-50 dark:bg-red-950/30 border-red-300 dark:border-red-800"
+                        : isSelected
+                        ? "bg-emerald-50/70 dark:bg-emerald-950/30 border-[#004D40] dark:border-emerald-600"
+                        : "bg-white dark:bg-slate-800 border-slate-200 dark:border-slate-700"
+                    }`}
+                  >
+                    <div className="flex items-center justify-between gap-2">
+                      <div className="flex items-center gap-2">
+                        <Truck
+                          className={`w-4 h-4 ${
+                            isAlert ? "text-red-600" : "text-[#004D40] dark:text-emerald-400"
+                          }`}
+                        />
+                        <strong className="text-sm font-black text-slate-900 dark:text-white">
+                          {trk.truckId}
+                        </strong>
+                        <span className="text-xs text-slate-500">{trk.truckPlate}</span>
                       </div>
-                      <div>
-                        <div className="flex items-center gap-1.5">
-                          <h3 className="font-extrabold text-base text-slate-900 dark:text-white">{t.truckId}</h3>
-                          <span className="text-xs font-mono text-slate-400">({t.truckPlate})</span>
-                        </div>
-                        <span className="text-xs text-slate-600 dark:text-slate-300 font-bold">{t.driverName}</span>
-                      </div>
-                    </div>
-
-                    <span className={`px-2.5 py-1 text-xs font-extrabold uppercase tracking-wider rounded-lg ${
-                      t.status === "Alert"
-                        ? "bg-red-100 text-red-700"
-                        : t.status === "Delivering"
-                        ? "bg-blue-100 text-blue-700"
-                        : "bg-amber-100 text-amber-700"
-                    }`}>
-                      {t.status}
-                    </span>
-                  </div>
-
-                  {/* Sacks on Truck Counter (Loaded vs. Delivered vs. Remaining) */}
-                  <div className="grid grid-cols-3 gap-2 bg-slate-50 dark:bg-slate-900/60 p-3 rounded-xl border border-slate-100 dark:border-slate-700 text-center mb-3">
-                    <div>
-                      <span className="text-[10px] text-slate-400 font-bold uppercase block">Loaded</span>
-                      <span className="text-sm font-black text-blue-600">{t.loadedSacks}</span>
-                    </div>
-                    <div>
-                      <span className="text-[10px] text-slate-400 font-bold uppercase block">Delivered</span>
-                      <span className="text-sm font-black text-emerald-600">{t.deliveredSacks}</span>
-                    </div>
-                    <div>
-                      <span className="text-[10px] text-slate-400 font-bold uppercase block">On Truck</span>
-                      <span className="text-sm font-black text-amber-600">{t.remainingSacks}</span>
-                    </div>
-                  </div>
-
-                  {/* Stop Progress Bar */}
-                  <div className="space-y-1.5 mb-3">
-                    <div className="flex justify-between text-xs font-bold">
-                      <span className="text-slate-600 dark:text-slate-400">
-                        {t.completedStops} of {t.totalStops} Stops Completed
+                      <span
+                        className={`px-2 py-0.5 rounded-full text-[10px] font-black uppercase ${
+                          isAlert
+                            ? "bg-red-600 text-white animate-pulse"
+                            : trk.status === "Idle"
+                            ? "bg-slate-200 text-slate-700 dark:bg-slate-700 dark:text-slate-200"
+                            : "bg-emerald-100 text-emerald-700 dark:bg-emerald-900/40 dark:text-emerald-300"
+                        }`}
+                      >
+                        {trk.status}
                       </span>
-                      <span className="text-[#00875A] font-extrabold">{fulfillmentPct}%</span>
                     </div>
-                    <div className="w-full bg-slate-200 dark:bg-slate-700 h-2 rounded-full overflow-hidden">
-                      <div
-                        className="bg-[#00875A] h-full rounded-full transition-all duration-300"
-                        style={{ width: `${fulfillmentPct}%` }}
-                      />
-                    </div>
-                  </div>
 
-                  {/* Current Location / Target Stop */}
-                  <div className="flex items-start gap-2 text-xs text-slate-600 dark:text-slate-300 bg-slate-100/60 dark:bg-slate-900/40 p-2.5 rounded-lg">
-                    <MapPin className="w-4 h-4 text-[#00875A] shrink-0 mt-0.5" />
-                    <div>
-                      <div className="font-bold text-slate-900 dark:text-white">Current Stop: {t.currentStopStoreName}</div>
-                      <div className="text-slate-500 text-[11px]">{t.currentLocationName}</div>
+                    <div className="mt-2 text-xs text-slate-600 dark:text-slate-300 space-y-1">
+                      <div>
+                        Driver: <strong>{trk.driverName || "Unassigned"}</strong>
+                      </div>
+                      <div className="flex items-center justify-between text-[11px] text-slate-500 dark:text-slate-400">
+                        <span className="flex items-center gap-1">
+                          <Package className="w-3.5 h-3.5" />
+                          {trk.deliveredSacks}/{trk.loadedSacks} sacks
+                        </span>
+                        <span className="flex items-center gap-1">
+                          <Gauge className="w-3.5 h-3.5" />
+                          {trk.speedKmh} km/h
+                        </span>
+                      </div>
+                      <div className="text-[11px] text-slate-400">
+                        Last ping: {formatManilaDateTime(trk.lastPingTime)}
+                      </div>
                     </div>
+
+                    {trk.sosAlert?.active && (
+                      <div className="mt-3 pt-3 border-t border-red-200 dark:border-red-900 space-y-2">
+                        <div className="text-xs font-black text-red-700 dark:text-red-300 flex items-center gap-1.5">
+                          <Siren className="w-4 h-4" />
+                          <span>SOS: {trk.sosAlert.reason}</span>
+                        </div>
+                        <button
+                          type="button"
+                          onClick={(e) => {
+                            e.stopPropagation();
+                            handleDispatchRescue(trk);
+                          }}
+                          className="w-full min-h-[44px] py-2 px-3 bg-red-600 hover:bg-red-700 text-white font-black text-xs rounded-xl cursor-pointer"
+                        >
+                          Send Rescue Acknowledgment
+                        </button>
+                      </div>
+                    )}
                   </div>
-                </div>
-              );
-            })}
-          </div>
+                );
+              })}
+            </div>
+          )}
         </div>
-      </section>
+      </div>
     </div>
   );
 }
+
+export default LiveFleetTracking;

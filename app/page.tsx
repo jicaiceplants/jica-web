@@ -1,6 +1,6 @@
 "use client";
 
-import { useState, useEffect, useRef } from "react";
+import { useState, useEffect, useCallback, useRef } from "react";
 import Sidebar from "@/components/Sidebar";
 import MetadataHeader from "@/components/LoadSlip/MetadataHeader";
 import OrderTable from "@/components/LoadSlip/OrderTable";
@@ -13,13 +13,16 @@ import AccountManagement from "@/components/AccountManagement";
 import ShiftReconciliation from "@/components/ShiftReconciliation";
 import TrashManagement from "@/components/TrashManagement";
 import WebLogin from "@/components/WebLogin";
-import { Sun, Moon, Sparkles, AlertTriangle, Siren, Send, X, MapPin, Truck, User, Clock, CheckCircle2 } from "lucide-react";
+import { Sun, Moon, Siren, Send, X, MapPin, Truck, User, CheckCircle2, Menu } from "lucide-react";
 import { DataService } from "@/lib/dataService";
 import { TruckVehicle, UserAccount } from "@/lib/types";
+import { supabase } from "@/lib/supabaseClient";
+import { getManilaDateString, getManilaTimeString, formatManilaDateTime } from "@/lib/dateUtils";
 
-const BACKEND_URL = process.env.NEXT_PUBLIC_BACKEND_URL || "http://localhost:8000";
+const BACKEND_URL = (process.env.NEXT_PUBLIC_BACKEND_URL || "https://jica-backend-production.up.railway.app")
+  .replace(/\/+$/, "")
+  .trim();
 
-// Web Audio API emergency alarm generator (alternating 880Hz / 1200Hz siren)
 class AudioAlarmService {
   private ctx: AudioContext | null = null;
   private timer: any = null;
@@ -38,17 +41,15 @@ class AudioAlarmService {
         high = !high;
         this.beep(high ? 1200 : 880);
       }, 700);
-    } catch (e) {
-      console.warn("Audio alarm warning:", e);
+    } catch {
+      // ignore autoplay blocks
     }
   }
 
   private beep(freq: number) {
     if (!this.ctx) return;
     try {
-      if (this.ctx.state === "suspended") {
-        this.ctx.resume();
-      }
+      if (this.ctx.state === "suspended") this.ctx.resume();
       const osc = this.ctx.createOscillator();
       const gain = this.ctx.createGain();
       osc.type = "sawtooth";
@@ -59,7 +60,7 @@ class AudioAlarmService {
       gain.connect(this.ctx.destination);
       osc.start();
       osc.stop(this.ctx.currentTime + 0.35);
-    } catch (_) { }
+    } catch { }
   }
 
   stop() {
@@ -71,7 +72,7 @@ class AudioAlarmService {
     if (this.ctx) {
       try {
         this.ctx.close();
-      } catch (_) { }
+      } catch { }
       this.ctx = null;
     }
   }
@@ -84,6 +85,7 @@ interface ActiveSosAlert {
   idempotency_key?: string;
   load_slip_id?: string;
   driver_id?: string;
+  driver_name?: string;
   truck_id: string;
   latitude: number;
   longitude: number;
@@ -97,100 +99,182 @@ interface ActiveSosAlert {
 export default function DispatchDashboard() {
   const [currentUser, setCurrentUser] = useState<UserAccount | null>(null);
   const [isAuthChecking, setIsAuthChecking] = useState(true);
+  const [sessionNotice, setSessionNotice] = useState<string | null>(null);
 
   const [activeTab, setActiveTab] = useState("Load Slip");
   const [isDarkMode, setIsDarkMode] = useState(false);
+  const [isSidebarOpen, setIsSidebarOpen] = useState(false);
 
-  // Metadata state for today's load slip
-  const [currentDate, setCurrentDate] = useState("");
-  const [currentTime, setCurrentTime] = useState("");
+  // Manila date/time for Load Slip
+  const [currentDate, setCurrentDate] = useState(() => getManilaDateString());
+  const [currentTime, setCurrentTime] = useState(() => getManilaTimeString());
   const [selectedTruckId, setSelectedTruckId] = useState("");
-  const [selectedInChargeId, setSelectedInChargeId] = useState("");
   const [selectedDriverId, setSelectedDriverId] = useState("");
 
   const [trucks, setTrucks] = useState<TruckVehicle[]>([]);
-  const [staffList, setStaffList] = useState<UserAccount[]>([]);
   const [driversList, setDriversList] = useState<UserAccount[]>([]);
 
   // Emergency SOS Alert State
   const [activeSosModal, setActiveSosModal] = useState<ActiveSosAlert | null>(null);
   const [dismissedAlertIds, setDismissedAlertIds] = useState<Set<string>>(new Set());
-  const [dispatcherReplyNote, setDispatcherReplyNote] = useState("Help is on the Way: Support vehicle & mechanic en route to your coordinates.");
+  const [dispatcherReplyNote, setDispatcherReplyNote] = useState(
+    "Help is on the Way: Support vehicle & mechanic en route to your coordinates."
+  );
   const [isSendingReply, setIsSendingReply] = useState(false);
   const [ackFeedback, setAckFeedback] = useState<string | null>(null);
 
-  // 1. Session Persistence & Authentication (24-hour expiration)
-  useEffect(() => {
-    try {
-      const raw = localStorage.getItem("jica_web_session");
-      if (raw) {
-        const session = JSON.parse(raw);
-        if (session && session.user && session.expiresAt && Date.now() < session.expiresAt) {
-          if (session.user.role === "Owner" || session.user.role === "Staff") {
-            setCurrentUser(session.user);
-            DataService.setCurrentUser(session.user);
-          } else {
-            localStorage.removeItem("jica_web_session");
-            setCurrentUser(null);
-          }
-        } else {
-          localStorage.removeItem("jica_web_session");
-          setCurrentUser(null);
-        }
-      } else {
-        setCurrentUser(null);
-      }
-    } catch (e) {
-      console.warn("Session check error:", e);
-      setCurrentUser(null);
-    } finally {
-      setIsAuthChecking(false);
-    }
+  const activeSosRef = useRef<ActiveSosAlert | null>(null);
+  activeSosRef.current = activeSosModal;
+
+  const forceLogout = useCallback((reason?: string) => {
+    audioAlarm.stop();
+    DataService.clearSession();
+    setCurrentUser(null);
+    setSessionNotice(
+      reason || "You have been logged out because this account was signed in on another device."
+    );
   }, []);
 
-  const handleLogout = () => {
+  // Register global 401 SESSION_REVOKED interceptor
+  useEffect(() => {
+    DataService.setSessionRevokedHandler((reason) => {
+      forceLogout(reason);
+    });
+    return () => DataService.setSessionRevokedHandler(null);
+  }, [forceLogout]);
+
+  // 1. Initial Session Verification
+  useEffect(() => {
+    const restoreAndVerifySession = async () => {
+      try {
+        const raw = localStorage.getItem("jica_web_session");
+        if (!raw) {
+          setCurrentUser(null);
+          return;
+        }
+        const session = JSON.parse(raw);
+        if (
+          session?.user &&
+          session?.sessionToken &&
+          session?.expiresAt &&
+          Date.now() < session.expiresAt &&
+          (session.user.role === "Owner" || session.user.role === "Staff")
+        ) {
+          DataService.setCurrentUser(session.user);
+          const check = await DataService.validateActiveSession();
+          if (check.valid) {
+            setCurrentUser(session.user);
+            setSessionNotice(null);
+          } else {
+            DataService.clearSession();
+            setCurrentUser(null);
+            setSessionNotice(check.reason || "Session signed out from another device.");
+          }
+        } else {
+          DataService.clearSession();
+          setCurrentUser(null);
+        }
+      } catch {
+        DataService.clearSession();
+        setCurrentUser(null);
+      } finally {
+        setIsAuthChecking(false);
+      }
+    };
+
+    restoreAndVerifySession();
+  }, []);
+
+  // 2. Strict Single Active Session Guard (Supabase Realtime + 5s Polling)
+  useEffect(() => {
+    if (!currentUser?.id) return;
+    const localToken = DataService.getSessionToken();
+    if (!localToken) {
+      forceLogout("Missing active session token. Please sign in again.");
+      return;
+    }
+
+    const channel = supabase
+      .channel(`web-session-guard-${currentUser.id}`)
+      .on(
+        "postgres_changes",
+        {
+          event: "UPDATE",
+          schema: "public",
+          table: "user_accounts",
+          filter: `id=eq.${currentUser.id}`
+        },
+        (payload: any) => {
+          const remoteToken = payload?.new?.active_session_token;
+          const isActive = payload?.new?.is_active;
+          const deletedAt = payload?.new?.deleted_at;
+
+          if (isActive === false || deletedAt) {
+            forceLogout("Your account has been deactivated.");
+            return;
+          }
+          if (remoteToken !== localToken) {
+            forceLogout("You have been logged out because this account was signed in on another device.");
+          }
+        }
+      )
+      .subscribe();
+
+    const pollInterval = setInterval(async () => {
+      const check = await DataService.validateActiveSession();
+      if (!check.valid) {
+        forceLogout(check.reason);
+      }
+    }, 5000);
+
+    return () => {
+      clearInterval(pollInterval);
+      supabase.removeChannel(channel);
+    };
+  }, [currentUser?.id, forceLogout]);
+
+  const handleLogout = async () => {
     audioAlarm.stop();
-    localStorage.removeItem("jica_web_session");
+    await DataService.logoutUser();
+    setSessionNotice(null);
     setCurrentUser(null);
   };
 
-  // 2. Load Core Data & Live Supabase Sync
+  // Keep Manila clock ticking cleanly every 30s
+  useEffect(() => {
+    const syncManilaClock = () => {
+      setCurrentDate(getManilaDateString());
+      setCurrentTime(getManilaTimeString());
+    };
+    syncManilaClock();
+    const timer = setInterval(syncManilaClock, 30000);
+    return () => clearInterval(timer);
+  }, []);
+
+  const refreshReferenceData = useCallback(async () => {
+    await DataService.fetchLiveFromSupabase();
+    const freshTrucks = DataService.getTrucks();
+    const freshDrivers = DataService.getDrivers();
+    setTrucks(freshTrucks);
+    setDriversList(freshDrivers);
+
+    setSelectedTruckId(prev =>
+      freshTrucks.some(t => t.id === prev) ? prev : freshTrucks[0]?.id || ""
+    );
+    setSelectedDriverId(prev =>
+      freshDrivers.some(d => d.id === prev) ? prev : freshDrivers[0]?.id || ""
+    );
+  }, []);
+
+  // 3. Load Core Data & Live Supabase Sync on Login / Tab switch
   useEffect(() => {
     if (!currentUser) return;
+    setTrucks(DataService.getTrucks());
+    setDriversList(DataService.getDrivers());
+    refreshReferenceData();
+  }, [currentUser, activeTab, refreshReferenceData]);
 
-    const now = new Date();
-    setCurrentDate(now.toISOString().split("T")[0]);
-    const hours = now.getHours().toString().padStart(2, "0");
-    const minutes = now.getMinutes().toString().padStart(2, "0");
-    setCurrentTime(`${hours}:${minutes}`);
-
-    const t = DataService.getTrucks();
-    const s = DataService.getStaff();
-    const d = DataService.getDrivers();
-
-    setTrucks(t);
-    setStaffList(s);
-    setDriversList(d);
-
-    if (t.length > 0) setSelectedTruckId(t[0].id);
-    if (s.length > 0) setSelectedInChargeId(s[0].id);
-    if (d.length > 0) setSelectedDriverId(d[0].id);
-
-    // Sync live from Supabase PostgreSQL on mount
-    DataService.fetchLiveFromSupabase().then(() => {
-      const freshTrucks = DataService.getTrucks();
-      const freshStaff = DataService.getStaff();
-      const freshDrivers = DataService.getDrivers();
-      setTrucks(freshTrucks);
-      setStaffList(freshStaff);
-      setDriversList(freshDrivers);
-      if (freshTrucks.length > 0 && !selectedTruckId) setSelectedTruckId(freshTrucks[0].id);
-      if (freshStaff.length > 0 && !selectedInChargeId) setSelectedInChargeId(freshStaff[0].id);
-      if (freshDrivers.length > 0 && !selectedDriverId) setSelectedDriverId(freshDrivers[0].id);
-    });
-  }, [currentUser]);
-
-  // 3. Global Audible Emergency SOS Alert Poller (every 3 seconds)
+  // 4. Global Audible Emergency SOS Alert Poller (every 4 seconds)
   useEffect(() => {
     if (!currentUser) return;
 
@@ -205,24 +289,26 @@ export default function DispatchDashboard() {
           if (activeUnack) {
             setActiveSosModal(activeUnack);
             audioAlarm.start();
-          } else if (activeSosModal && !alerts.find(a => a.id === activeSosModal.id && a.status === "Active")) {
-            // Alert was resolved/acknowledged elsewhere
+          } else if (
+            activeSosRef.current &&
+            !alerts.find(a => a.id === activeSosRef.current?.id && a.status === "Active")
+          ) {
             audioAlarm.stop();
             setActiveSosModal(null);
           }
         }
-      } catch (err) {
-        // Silent catch for background poller
+      } catch {
+        // silent catch
       }
     };
 
     checkSosAlerts();
-    const interval = setInterval(checkSosAlerts, 3000);
+    const interval = setInterval(checkSosAlerts, 4000);
     return () => {
       clearInterval(interval);
       audioAlarm.stop();
     };
-  }, [currentUser, dismissedAlertIds, activeSosModal]);
+  }, [currentUser, dismissedAlertIds]);
 
   const handleDismissSos = () => {
     audioAlarm.stop();
@@ -241,9 +327,9 @@ export default function DispatchDashboard() {
   const handleAcknowledgeSos = async () => {
     if (!activeSosModal) return;
     setIsSendingReply(true);
-
     try {
-      const replyMsg = dispatcherReplyNote.trim() || "Help is on the Way: Mechanic dispatch en route to your coordinates.";
+      const replyMsg =
+        dispatcherReplyNote.trim() || "Help is on the Way: Support vehicle & mechanic en route to your coordinates.";
       const ackBy = currentUser?.name || "Office Dispatcher";
 
       const res = await fetch(`${BACKEND_URL}/api/v1/telemetry/sos/acknowledge`, {
@@ -257,7 +343,6 @@ export default function DispatchDashboard() {
       });
 
       audioAlarm.stop();
-
       if (res.ok) {
         setAckFeedback("Reply broadcasted! Driver has been notified.");
         setTimeout(() => {
@@ -267,7 +352,7 @@ export default function DispatchDashboard() {
       } else {
         setActiveSosModal(null);
       }
-    } catch (e) {
+    } catch {
       audioAlarm.stop();
       setActiveSosModal(null);
     } finally {
@@ -285,22 +370,20 @@ export default function DispatchDashboard() {
               currentTime={currentTime}
               selectedTruckId={selectedTruckId}
               onTruckChange={setSelectedTruckId}
-              selectedInChargeId={selectedInChargeId}
-              onInChargeChange={setSelectedInChargeId}
               selectedDriverId={selectedDriverId}
               onDriverChange={setSelectedDriverId}
               trucks={trucks}
-              staffList={staffList}
               driversList={driversList}
+              currentUser={currentUser!}
             />
             <OrderTable
               currentDate={currentDate}
               currentTime={currentTime}
               truckId={selectedTruckId}
-              inChargeId={selectedInChargeId}
               driverId={selectedDriverId}
-              onSavedSuccess={(slip) => {
-                // Keep staff on page with notification
+              currentUser={currentUser!}
+              onSavedSuccess={() => {
+                refreshReferenceData();
               }}
             />
           </>
@@ -322,102 +405,130 @@ export default function DispatchDashboard() {
       case "Trash":
         return <TrashManagement />;
       default:
-        return (
-          <>
-            <MetadataHeader
-              currentDate={currentDate}
-              currentTime={currentTime}
-              selectedTruckId={selectedTruckId}
-              onTruckChange={setSelectedTruckId}
-              selectedInChargeId={selectedInChargeId}
-              onInChargeChange={setSelectedInChargeId}
-              selectedDriverId={selectedDriverId}
-              onDriverChange={setSelectedDriverId}
-              trucks={trucks}
-              staffList={staffList}
-              driversList={driversList}
-            />
-            <OrderTable
-              currentDate={currentDate}
-              currentTime={currentTime}
-              truckId={selectedTruckId}
-              inChargeId={selectedInChargeId}
-              driverId={selectedDriverId}
-            />
-          </>
-        );
+        return null;
     }
   };
 
   const tabTitles: Record<string, { title: string; subtitle: string }> = {
-    "Load Slip": { title: "Digital Load Slip Builder", subtitle: "Build and dispatch daily ice deliveries for Cagayan de Oro routes" },
-    "Load Slip History": { title: "Load Slip History & Archive", subtitle: "Audit past deliveries, cash collections, and partial sack adjustments" },
-    "Live Fleet Tracking": { title: "Live Fleet & Driver Corridor", subtitle: "Real-time truck locations, delivered sacks, and roadside SOS alerts" },
-    "Shift Closing": { title: "End-of-Day Truck Shift Closing", subtitle: "Reconcile delivered sacks, returned cold storage inventory, and remitted cash collection" },
-    "User & Passwords": { title: "User & Password Management", subtitle: "Reset passwords and administer driver and dispatcher mobile credentials" },
-    "Employee Management": { title: "Employee Roster", subtitle: "Manage staff accounts, phone contacts, and assigned roles" },
-    "Invoices": { title: "Invoices & Official Receipts", subtitle: "Review cash receipts and formal charge invoices for institutional accounts" },
-    "Settings": { title: "Settings & Pricing", subtitle: "Configure wholesale ice rates and manage Cagayan de Oro delivery location hubs" }
+    "Load Slip": {
+      title: "Digital Load Slip Builder",
+      subtitle: "Build and dispatch daily ice deliveries for Cagayan de Oro routes (Asia/Manila)"
+    },
+    "Load Slip History": {
+      title: "Load Slip History & Archive",
+      subtitle: "Audit past deliveries, cash collections, and partial sack adjustments"
+    },
+    "Live Fleet Tracking": {
+      title: "Live Fleet & Driver Corridor",
+      subtitle: "Real-time truck locations, delivered sacks, and roadside SOS alerts"
+    },
+    "Shift Closing": {
+      title: "End-of-Day Truck Shift Closing",
+      subtitle: "Confirm finished deliveries, cash safe remittances, and returned ice sacks"
+    },
+    "User & Passwords": {
+      title: "User & Password Management",
+      subtitle: "Reset passwords and manage driver and dispatcher credentials"
+    },
+    "Employee Management": {
+      title: "Employee Roster",
+      subtitle: "Manage staff accounts, phone contacts, and assigned roles"
+    },
+    Invoices: {
+      title: "Invoices & Official Receipts",
+      subtitle: "Review sales receipts and charge invoices linked cleanly to load slips"
+    },
+    Settings: {
+      title: "Settings & Pricing",
+      subtitle: "Configure wholesale ice rates, fleet capacities, and Cagayan de Oro delivery hubs"
+    },
+    Trash: {
+      title: "Trash & 30-Day Recovery",
+      subtitle: "Restore soft-deleted records or purge historical items (Owner only)"
+    }
   };
 
   if (isAuthChecking) {
     return (
-      <div className="h-screen w-full bg-[#004D40] flex flex-col items-center justify-center text-white">
+      <div className="h-dvh w-full bg-[#004D40] flex flex-col items-center justify-center text-white p-6">
         <img src="/jica-logo.png" alt="JICA Logo" className="w-24 h-auto animate-pulse mb-4" />
-        <p className="text-sm font-bold tracking-widest uppercase text-emerald-200">
-          Loading JICA Dispatch Portal...
+        <p className="text-sm font-bold tracking-widest uppercase text-emerald-200 text-center">
+          Verifying Session & Loading Dispatch Portal...
         </p>
       </div>
     );
   }
 
   if (!currentUser) {
-    return <WebLogin onLoginSuccess={(user) => setCurrentUser(user)} />;
+    return (
+      <WebLogin
+        sessionNotice={sessionNotice}
+        onLoginSuccess={(user) => {
+          setSessionNotice(null);
+          setCurrentUser(user);
+        }}
+      />
+    );
   }
 
   const headerInfo = tabTitles[activeTab] || { title: activeTab, subtitle: "Manage your ice logistics system" };
 
   return (
-    <div className={`${isDarkMode ? "dark" : ""} flex h-screen w-full bg-slate-100 dark:bg-slate-900 font-sans text-slate-900 dark:text-slate-100 overflow-hidden transition-colors duration-200`}>
-      {/* Sidebar Navigation */}
+    <div
+      className={`${
+        isDarkMode ? "dark" : ""
+      } flex h-dvh w-full bg-slate-100 dark:bg-slate-900 font-sans text-slate-900 dark:text-slate-100 overflow-hidden transition-colors duration-200`}
+    >
       <Sidebar
         activeTab={activeTab}
         setActiveTab={setActiveTab}
         currentUser={currentUser}
         onLogout={handleLogout}
+        isOpen={isSidebarOpen}
+        onClose={() => setIsSidebarOpen(false)}
       />
 
-      {/* Main Content Area */}
-      <main className="flex-1 flex flex-col h-full bg-transparent overflow-y-auto relative">
-        <header className="p-8 pb-5 border-b border-slate-200 dark:border-slate-800 sticky top-0 bg-slate-100/95 dark:bg-slate-900/95 backdrop-blur-md z-20 flex justify-between items-end">
-          <div>
-            <h1 className="text-3xl font-black text-slate-900 dark:text-white tracking-tight">
-              {headerInfo.title}
-            </h1>
-            <p className="text-slate-500 dark:text-slate-400 mt-1 text-sm font-medium">
-              {headerInfo.subtitle}
-            </p>
+      <main className="flex-1 flex flex-col h-full bg-transparent overflow-y-auto scroll-touch relative min-w-0">
+        <header className="p-4 sm:p-6 lg:p-8 pb-4 border-b border-slate-200 dark:border-slate-800 sticky top-0 bg-slate-100/95 dark:bg-slate-900/95 backdrop-blur-md z-20 flex justify-between items-center gap-3">
+          <div className="flex items-center gap-3 min-w-0">
+            <button
+              type="button"
+              onClick={() => setIsSidebarOpen(true)}
+              aria-label="Open Menu"
+              className="lg:hidden min-w-[44px] min-h-[44px] flex items-center justify-center rounded-xl bg-white dark:bg-slate-800 border border-slate-200 dark:border-slate-700 text-slate-700 dark:text-slate-200 shadow-xs shrink-0"
+            >
+              <Menu className="w-5 h-5" />
+            </button>
+
+            <div className="min-w-0">
+              <h1 className="text-xl sm:text-2xl lg:text-3xl font-black text-slate-900 dark:text-white tracking-tight truncate">
+                {headerInfo.title}
+              </h1>
+              <p className="text-slate-500 dark:text-slate-400 mt-0.5 text-xs sm:text-sm font-medium truncate">
+                {headerInfo.subtitle}
+              </p>
+            </div>
           </div>
 
           <button
+            type="button"
             onClick={() => setIsDarkMode(!isDarkMode)}
-            className="p-3 rounded-xl bg-white dark:bg-slate-800 text-slate-600 dark:text-slate-300 border border-slate-200 dark:border-slate-700 shadow-sm hover:bg-slate-100 dark:hover:bg-slate-700 transition-all cursor-pointer"
+            className="min-w-[44px] min-h-[44px] p-2.5 rounded-xl bg-white dark:bg-slate-800 text-slate-600 dark:text-slate-300 border border-slate-200 dark:border-slate-700 shadow-sm hover:bg-slate-100 dark:hover:bg-slate-700 transition-all cursor-pointer shrink-0 flex items-center justify-center"
             title="Toggle Light/Dark Theme"
           >
             {isDarkMode ? <Sun className="w-5 h-5 text-amber-400" /> : <Moon className="w-5 h-5 text-slate-600" />}
           </button>
         </header>
 
-        <div className="p-8 flex-1 max-w-[1450px] w-full mx-auto space-y-8">
+        <div className="p-4 sm:p-6 lg:p-8 flex-1 max-w-[1450px] w-full mx-auto space-y-6">
           {renderContent()}
         </div>
       </main>
 
       {/* GLOBAL AUDIBLE EMERGENCY SOS ALERT MODAL */}
       {activeSosModal && (
-        <div className="fixed inset-0 z-50 bg-red-950/80 backdrop-blur-md flex items-center justify-center p-4 animate-in fade-in zoom-in-95 duration-150">
-          <div className="bg-white dark:bg-slate-900 rounded-3xl border-4 border-red-600 shadow-2xl max-w-xl w-full p-6 sm:p-8 relative overflow-hidden">
-            {/* Top Siren Animation Stripe */}
+        <div className="fixed inset-0 z-[70] bg-red-950/80 backdrop-blur-md flex items-center justify-center p-4 overflow-y-auto">
+          <div className="bg-white dark:bg-slate-900 rounded-3xl border-4 border-red-600 shadow-2xl max-w-xl w-full p-6 sm:p-8 relative overflow-hidden max-h-[90dvh] overflow-y-auto">
             <div className="absolute top-0 left-0 right-0 h-3 bg-gradient-to-r from-red-600 via-amber-500 to-red-600 animate-pulse" />
 
             <div className="flex justify-between items-start pt-2">
@@ -431,7 +542,7 @@ export default function DispatchDashboard() {
                       CRITICAL ALERT
                     </span>
                     <span className="text-xs text-slate-500 dark:text-slate-400 font-mono">
-                      {new Date(activeSosModal.created_at).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit', second: '2-digit' })}
+                      {formatManilaDateTime(activeSosModal.created_at)}
                     </span>
                   </div>
                   <h2 className="text-2xl font-black text-red-600 dark:text-red-400 mt-1">
@@ -441,15 +552,15 @@ export default function DispatchDashboard() {
               </div>
 
               <button
+                type="button"
                 onClick={handleDismissSos}
-                className="p-2 rounded-full text-slate-400 hover:text-slate-700 dark:hover:text-slate-200 hover:bg-slate-100 dark:hover:bg-slate-800"
+                className="min-w-[44px] min-h-[44px] flex items-center justify-center rounded-full text-slate-400 hover:text-slate-700 dark:hover:text-slate-200 hover:bg-slate-100 dark:hover:bg-slate-800"
                 title="Mute & Dismiss Alarm"
               >
                 <X className="w-6 h-6" />
               </button>
             </div>
 
-            {/* Breakdown & Telemetry Details */}
             <div className="mt-6 bg-red-50 dark:bg-red-950/40 border border-red-200 dark:border-red-900 rounded-2xl p-5 space-y-3">
               <div className="flex items-center justify-between border-b border-red-200/60 dark:border-red-900/60 pb-3">
                 <span className="text-xs font-bold uppercase tracking-wider text-slate-500 dark:text-slate-400">
@@ -472,8 +583,10 @@ export default function DispatchDashboard() {
                 <div className="flex items-center gap-2">
                   <User className="w-4 h-4 text-red-600 shrink-0" />
                   <div>
-                    <span className="text-slate-500 block">Driver ID</span>
-                    <strong className="text-slate-900 dark:text-white font-bold truncate max-w-[140px] block">{activeSosModal.driver_id || "Mobile Driver"}</strong>
+                    <span className="text-slate-500 block">Driver</span>
+                    <strong className="text-slate-900 dark:text-white font-bold truncate max-w-[140px] block">
+                      {activeSosModal.driver_name || activeSosModal.driver_id || "Mobile Driver"}
+                    </strong>
                   </div>
                 </div>
               </div>
@@ -481,22 +594,24 @@ export default function DispatchDashboard() {
               <div className="flex items-center gap-2 pt-1 text-xs">
                 <MapPin className="w-4 h-4 text-red-600 shrink-0" />
                 <span className="text-slate-600 dark:text-slate-300 font-mono">
-                  Coordinates: <strong>{activeSosModal.latitude?.toFixed(5)}, {activeSosModal.longitude?.toFixed(5)}</strong>
+                  Coordinates:{" "}
+                  <strong>
+                    {activeSosModal.latitude?.toFixed(5)}, {activeSosModal.longitude?.toFixed(5)}
+                  </strong>
                 </span>
               </div>
             </div>
 
-            {/* Dispatcher Response Action */}
             <div className="mt-5 space-y-3">
               <label className="block text-xs font-bold uppercase tracking-wider text-slate-700 dark:text-slate-300">
-                Send Dispatcher Feedback to Driver ("Help is on the Way")
+                Send Dispatcher Feedback to Driver (&quot;Help is on the Way&quot;)
               </label>
               <textarea
                 rows={2}
                 value={dispatcherReplyNote}
                 onChange={(e) => setDispatcherReplyNote(e.target.value)}
                 placeholder="Type response to driver..."
-                className="w-full px-4 py-2.5 bg-slate-50 dark:bg-slate-800 border border-slate-300 dark:border-slate-700 rounded-xl text-xs text-slate-900 dark:text-white font-medium focus:ring-2 focus:ring-red-600 focus:outline-hidden"
+                className="w-full px-4 py-2.5 bg-slate-50 dark:bg-slate-800 border border-slate-300 dark:border-slate-700 rounded-xl text-base sm:text-xs text-slate-900 dark:text-white font-medium focus:ring-2 focus:ring-red-600 focus:outline-hidden"
               />
 
               {ackFeedback && (
@@ -508,17 +623,19 @@ export default function DispatchDashboard() {
 
               <div className="flex flex-col sm:flex-row gap-2.5 pt-1">
                 <button
+                  type="button"
                   onClick={handleAcknowledgeSos}
                   disabled={isSendingReply}
-                  className="flex-1 py-3 px-4 bg-red-600 hover:bg-red-700 text-white font-black text-xs uppercase tracking-wider rounded-xl shadow-lg shadow-red-600/30 transition-all flex items-center justify-center gap-2 cursor-pointer disabled:opacity-60"
+                  className="flex-1 min-h-[44px] py-3 px-4 bg-red-600 hover:bg-red-700 text-white font-black text-xs uppercase tracking-wider rounded-xl shadow-lg shadow-red-600/30 transition-all flex items-center justify-center gap-2 cursor-pointer disabled:opacity-60"
                 >
                   <Send className="w-4 h-4" />
                   <span>{isSendingReply ? "Broadcasting..." : "Broadcast: Help is on the Way"}</span>
                 </button>
 
                 <button
+                  type="button"
                   onClick={handleViewOnFleetMap}
-                  className="py-3 px-4 bg-slate-900 hover:bg-slate-800 text-white dark:bg-slate-700 dark:hover:bg-slate-600 font-bold text-xs rounded-xl transition-all flex items-center justify-center gap-2 cursor-pointer"
+                  className="min-h-[44px] py-3 px-4 bg-slate-900 hover:bg-slate-800 text-white dark:bg-slate-700 dark:hover:bg-slate-600 font-bold text-xs rounded-xl transition-all flex items-center justify-center gap-2 cursor-pointer"
                 >
                   <MapPin className="w-4 h-4" />
                   <span>View on Fleet Map</span>

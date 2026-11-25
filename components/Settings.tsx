@@ -1,785 +1,799 @@
 "use client";
 
-import { useState, useEffect, useRef } from "react";
-import { IceProduct, DeliveryLocation, TruckVehicle } from "@/lib/types";
+import React, { useState, useEffect, useCallback } from "react";
 import { DataService } from "@/lib/dataService";
 import { supabase } from "@/lib/supabaseClient";
-import { compressImage } from "@/lib/imageUtils";
-import { 
-  Save, 
-  Plus, 
-  Trash2, 
-  MapPin, 
-  ShieldCheck, 
-  FileText, 
-  Check, 
-  AlertCircle, 
-  Truck, 
-  Package, 
-  Upload, 
-  X, 
-  Layers 
+import {
+  IceProduct,
+  TruckVehicle,
+  TruckCapacityInfo,
+  DeliveryLocation
+} from "@/lib/types";
+import {
+  formatPhp,
+  sanitizePriceTyping,
+  normalizePriceOnBlur
+} from "@/lib/currencyUtils";
+import { AddLocationModal } from "@/components/AddLocationModal";
+import ConfirmModal from "@/components/ConfirmModal";
+import {
+  Package,
+  Truck,
+  MapPin,
+  Plus,
+  Edit3,
+  Trash2,
+  CheckCircle2,
+  AlertTriangle,
+  RefreshCw,
+  X,
+  Save
 } from "lucide-react";
-import ConfirmModal from "./ConfirmModal";
-import AddLocationModal from "./AddLocationModal";
-import ComplianceModal from "./ComplianceModal";
 
-export default function Settings() {
+type SettingsTab = "products" | "fleet" | "hubs";
+
+export function Settings() {
+  const [activeTab, setActiveTab] = useState<SettingsTab>("products");
   const [products, setProducts] = useState<IceProduct[]>([]);
   const [trucks, setTrucks] = useState<TruckVehicle[]>([]);
+  const [capacityList, setCapacityList] = useState<TruckCapacityInfo[]>([]);
   const [locations, setLocations] = useState<DeliveryLocation[]>([]);
 
-  // Modals & Triggers
-  const [isAddProductOpen, setIsAddProductOpen] = useState(false);
-  const [isAddTruckOpen, setIsAddTruckOpen] = useState(false);
-  const [isAddLocationOpen, setIsAddLocationOpen] = useState(false);
-  const [isComplianceOpen, setIsComplianceOpen] = useState(false);
-  const [complianceTab, setComplianceTab] = useState<"privacy" | "terms" | "gps">("privacy");
+  // String price map per product card so typing "", "0", "0." works cleanly without jump/clamp
+  const [priceStrMap, setPriceStrMap] = useState<Record<string, string>>({});
+  const [savingPriceId, setSavingPriceId] = useState<string | null>(null);
 
-  // Deletion targets
-  const [productToDelete, setProductToDelete] = useState<string | null>(null);
-  const [truckToDelete, setTruckToDelete] = useState<string | null>(null);
-  const [locationToDelete, setLocationToDelete] = useState<string | null>(null);
+  const [isLoading, setIsLoading] = useState(true);
+  const [isRefreshing, setIsRefreshing] = useState(false);
+  const [banner, setBanner] = useState<{ type: "success" | "error"; text: string } | null>(null);
 
-  const [saveSuccess, setSaveSuccess] = useState(false);
+  // Add / Edit Product Modal
+  const [productModalOpen, setProductModalOpen] = useState(false);
+  const [editingProduct, setEditingProduct] = useState<IceProduct | null>(null);
+  const [prodName, setProdName] = useState("");
+  const [prodCategory, setProdCategory] = useState<IceProduct["category"]>("Tube");
+  const [prodSackSize, setProdSackSize] = useState("50 kg");
+  const [prodPriceStr, setProdPriceStr] = useState("0");
+  const [isSavingProduct, setIsSavingProduct] = useState(false);
 
-  // Add Product Form State
-  const [newProdName, setNewProdName] = useState("");
-  const [newProdCategory, setNewProdCategory] = useState<"Tube" | "Block" | "Crushed">("Tube");
-  const [newProdSackSize, setNewProdSackSize] = useState("50kg Big Sack");
-  const [newProdPrice, setNewProdPrice] = useState(150);
-  const [newProdPhoto, setNewProdPhoto] = useState("");
-  const [prodFormError, setProdFormError] = useState("");
-  const [isSubmittingProduct, setIsSubmittingProduct] = useState(false);
-  const prodFileInputRef = useRef<HTMLInputElement>(null);
+  // Add / Edit Truck Modal
+  const [truckModalOpen, setTruckModalOpen] = useState(false);
+  const [editingTruck, setEditingTruck] = useState<TruckVehicle | null>(null);
+  const [truckIdInput, setTruckIdInput] = useState("");
+  const [truckPlate, setTruckPlate] = useState("");
+  const [truckModel, setTruckModel] = useState("");
+  const [truckCapStr, setTruckCapStr] = useState("120");
+  const [isSavingTruck, setIsSavingTruck] = useState(false);
 
-  // Add Truck Form State
-  const [newTruckId, setNewTruckId] = useState("");
-  const [newTruckPlate, setNewTruckPlate] = useState("");
-  const [newTruckModel, setNewTruckModel] = useState("Isuzu Elf (6-Wheeler Closed)");
-  const [newTruckCapacity, setNewTruckCapacity] = useState(120);
-  const [newTruckPhoto, setNewTruckPhoto] = useState("");
-  const [truckFormError, setTruckFormError] = useState("");
-  const [isSubmittingTruck, setIsSubmittingTruck] = useState(false);
-  const truckFileInputRef = useRef<HTMLInputElement>(null);
+  // Delivery Hub Modal
+  const [addLocOpen, setAddLocOpen] = useState(false);
 
-  const reloadData = async () => {
-    // 1. Initial cached values
-    setProducts(DataService.getProducts());
-    setTrucks(DataService.getTrucks());
-    setLocations(DataService.getLocations());
+  // Confirm Soft Delete Modal
+  const [deleteTarget, setDeleteTarget] = useState<{
+    kind: "product" | "truck" | "location";
+    id: string;
+    label: string;
+  } | null>(null);
 
-    // 2. Fetch live from Supabase PostgreSQL (deleted_at IS NULL AND is_active = true)
+  const reloadData = useCallback(async (showSpinner = false) => {
+    if (showSpinner) setIsRefreshing(true);
     try {
-      const [hubsRes, prodsRes, trucksRes] = await Promise.all([
-        supabase
-          .from("delivery_hubs")
-          .select("*")
-          .is("deleted_at", null)
-          .eq("is_active", true)
-          .order("name", { ascending: true }),
-        supabase
-          .from("products")
-          .select("*")
-          .is("deleted_at", null)
-          .eq("is_active", true)
-          .order("name", { ascending: true }),
-        supabase
-          .from("trucks")
-          .select("*")
-          .is("deleted_at", null)
-          .eq("is_active", true)
-          .order("truck_code", { ascending: true })
-      ]);
+      await DataService.fetchLiveFromSupabase();
+      const cap = await DataService.fetchTrucksCapacity();
+      const prods = DataService.getProducts();
+      const trks = DataService.getTrucks();
+      const locs = DataService.getLocations();
 
-      if (!hubsRes.error && hubsRes.data) {
-        const mappedLocations: DeliveryLocation[] = hubsRes.data.map(h => ({
-          id: h.id,
-          name: h.name,
-          address: h.address,
-          latitude: Number(h.latitude),
-          longitude: Number(h.longitude),
-          zone: "City Proper" as const
-        }));
-        setLocations(mappedLocations);
-        localStorage.setItem("jica_locations", JSON.stringify(mappedLocations));
-      }
+      setProducts(prods);
+      setTrucks(trks);
+      setCapacityList(cap);
+      setLocations(locs);
 
-      if (!prodsRes.error && prodsRes.data && prodsRes.data.length > 0) {
-        const mappedProducts: IceProduct[] = prodsRes.data.map(p => ({
-          id: p.id,
-          name: p.name,
-          category: p.category as any,
-          sackSize: p.sack_size || "Standard",
-          price: Number(p.price_per_sack || 0),
-          inStock: 500,
-          imageUrl: p.photo_url || undefined
-        }));
-        setProducts(mappedProducts);
-        localStorage.setItem("jica_products", JSON.stringify(mappedProducts));
-      }
-
-      if (!trucksRes.error && trucksRes.data && trucksRes.data.length > 0) {
-        const mappedTrucks: TruckVehicle[] = trucksRes.data.map(t => ({
-          id: t.truck_code,
-          plateNumber: t.plate_number,
-          model: t.model || "Isuzu Elf",
-          capacitySacks: t.capacity_sacks || 120,
-          status: "Available" as const
-        }));
-        setTrucks(mappedTrucks);
-        localStorage.setItem("jica_trucks", JSON.stringify(mappedTrucks));
-      }
-    } catch (e) {
-      console.warn("Settings live sync notice:", e);
+      const initialPrices: Record<string, string> = {};
+      prods.forEach(p => {
+        initialPrices[p.id] = String(p.price ?? 0);
+      });
+      setPriceStrMap(initialPrices);
+    } finally {
+      setIsLoading(false);
+      setIsRefreshing(false);
     }
-  };
-
-  useEffect(() => {
-    reloadData();
   }, []);
 
-  const handleUpdatePrice = (id: string, newPrice: number) => {
-    setProducts(prev =>
-      prev.map(p => (p.id === id ? { ...p, price: newPrice } : p))
-    );
-  };
+  useEffect(() => {
+    reloadData(false);
 
-  const handleSaveAll = () => {
-    products.forEach(p => {
-      DataService.updateProductPrice(p.id, p.price);
-    });
-    setSaveSuccess(true);
-    setTimeout(() => setSaveSuccess(false), 3000);
-  };
+    const channel = supabase
+      .channel("settings-realtime")
+      .on("postgres_changes", { event: "*", schema: "public", table: "products" }, () => {
+        reloadData(false);
+      })
+      .on("postgres_changes", { event: "*", schema: "public", table: "trucks" }, () => {
+        reloadData(false);
+      })
+      .on("postgres_changes", { event: "*", schema: "public", table: "delivery_hubs" }, () => {
+        reloadData(false);
+      })
+      .subscribe();
 
-  // --- PRODUCT MANAGEMENT ---
-  const handleProductPhotoUpload = async (e: React.ChangeEvent<HTMLInputElement>) => {
-    const file = e.target.files?.[0];
-    if (!file) return;
-    try {
-      setProdFormError("");
-      const compressed = await compressImage(file, 600, 0.8);
-      setNewProdPhoto(compressed);
-    } catch (err: any) {
-      setProdFormError(err.message || "Failed to process product image.");
+    return () => {
+      supabase.removeChannel(channel);
+    };
+  }, [reloadData]);
+
+  const handleCardPriceChange = (prodId: string, raw: string) => {
+    const valid = sanitizePriceTyping(raw);
+    if (valid !== null) {
+      setPriceStrMap(prev => ({ ...prev, [prodId]: valid }));
     }
   };
 
-  const handleCreateProduct = (e: React.FormEvent) => {
-    e.preventDefault();
-    if (!newProdName.trim()) {
-      setProdFormError("Product Name is required.");
-      return;
-    }
-    if (newProdPrice <= 0) {
-      setProdFormError("Price must be greater than ₱0.");
-      return;
-    }
+  const handleSaveCardPrice = async (prod: IceProduct) => {
+    const raw = priceStrMap[prod.id] ?? String(prod.price ?? 0);
+    const normalized = normalizePriceOnBlur(raw);
+    setPriceStrMap(prev => ({ ...prev, [prod.id]: String(normalized) }));
+    setSavingPriceId(prod.id);
+    setBanner(null);
 
-    setIsSubmittingProduct(true);
-    try {
-      DataService.addProduct({
-        name: newProdName.trim(),
-        category: newProdCategory,
-        sackSize: newProdSackSize.trim() || "Standard",
-        price: newProdPrice,
-        inStock: 500,
-        imageUrl: newProdPhoto || undefined
+    const ok = await DataService.updateProductPrice(prod.id, normalized);
+    setSavingPriceId(null);
+
+    if (ok) {
+      setProducts(prev => prev.map(p => (p.id === prod.id ? { ...p, price: normalized } : p)));
+      setBanner({
+        type: "success",
+        text: `Updated "${prod.name}" standard price to PHP ${formatPhp(normalized)}.`
       });
-
-      setIsAddProductOpen(false);
-      setNewProdName("");
-      setNewProdPrice(150);
-      setNewProdPhoto("");
-      setProdFormError("");
-      reloadData();
-    } finally {
-      setIsSubmittingProduct(false);
+    } else {
+      setBanner({ type: "error", text: `Failed to save price for "${prod.name}".` });
     }
   };
 
-  const executeDeleteProduct = () => {
-    if (productToDelete) {
-      DataService.deleteProduct(productToDelete);
-      reloadData();
-      setProductToDelete(null);
-    }
+  const openAddProductModal = () => {
+    setEditingProduct(null);
+    setProdName("");
+    setProdCategory("Tube");
+    setProdSackSize("50 kg");
+    setProdPriceStr("0");
+    setProductModalOpen(true);
   };
 
-  // --- TRUCK MANAGEMENT ---
-  const handleTruckPhotoUpload = async (e: React.ChangeEvent<HTMLInputElement>) => {
-    const file = e.target.files?.[0];
-    if (!file) return;
-    try {
-      setTruckFormError("");
-      const compressed = await compressImage(file, 600, 0.8);
-      setNewTruckPhoto(compressed);
-    } catch (err: any) {
-      setTruckFormError(err.message || "Failed to process truck image.");
-    }
+  const openEditProductModal = (prod: IceProduct) => {
+    setEditingProduct(prod);
+    setProdName(prod.name);
+    setProdCategory(prod.category);
+    setProdSackSize(prod.sackSize);
+    setProdPriceStr(String(prod.price ?? 0));
+    setProductModalOpen(true);
   };
 
-  const handleCreateTruck = (e: React.FormEvent) => {
+  const handleSaveProductModal = async (e: React.FormEvent) => {
     e.preventDefault();
-    const cleanId = newTruckId.trim().toUpperCase();
-    const cleanPlate = newTruckPlate.trim().toUpperCase();
-
-    if (!cleanId || !cleanPlate) {
-      setTruckFormError("Truck ID and Plate Number are required.");
+    if (!prodName.trim()) {
+      setBanner({ type: "error", text: "Product name is required." });
       return;
     }
 
-    setIsSubmittingTruck(true);
-    try {
-      DataService.addTruck({
+    const finalPrice = normalizePriceOnBlur(prodPriceStr);
+    setIsSavingProduct(true);
+    setBanner(null);
+
+    if (editingProduct) {
+      const updated = await DataService.updateProduct(editingProduct.id, {
+        name: prodName.trim(),
+        category: prodCategory,
+        sackSize: prodSackSize.trim() || "50 kg",
+        price: finalPrice
+      });
+      setIsSavingProduct(false);
+      if (updated) {
+        setProductModalOpen(false);
+        await reloadData(false);
+        setBanner({ type: "success", text: `Updated product "${updated.name}".` });
+      } else {
+        setBanner({ type: "error", text: "Failed to update product." });
+      }
+    } else {
+      const res = await DataService.addProduct({
+        name: prodName.trim(),
+        category: prodCategory,
+        sackSize: prodSackSize.trim() || "50 kg",
+        price: finalPrice,
+        inStock: 0
+      });
+      setIsSavingProduct(false);
+      if (res.success) {
+        setProductModalOpen(false);
+        await reloadData(false);
+        setBanner({
+          type: "success",
+          text: `Added product "${prodName.trim()}" at PHP ${formatPhp(finalPrice)}.`
+        });
+      } else {
+        setBanner({ type: "error", text: res.message || "Unable to add product." });
+      }
+    }
+  };
+
+  const openAddTruckModal = () => {
+    setEditingTruck(null);
+    setTruckIdInput("");
+    setTruckPlate("");
+    setTruckModel("");
+    setTruckCapStr("120");
+    setTruckModalOpen(true);
+  };
+
+  const openEditTruckModal = (trk: TruckVehicle) => {
+    setEditingTruck(trk);
+    setTruckIdInput(trk.id);
+    setTruckPlate(trk.plateNumber);
+    setTruckModel(trk.model);
+    setTruckCapStr(String(trk.sackCapacity ?? trk.capacitySacks ?? 120));
+    setTruckModalOpen(true);
+  };
+
+  const handleSaveTruckModal = async (e: React.FormEvent) => {
+    e.preventDefault();
+    const cleanId = truckIdInput.trim().toUpperCase();
+    const cleanPlate = truckPlate.trim().toUpperCase();
+    const cleanModel = truckModel.trim();
+    const parsedCap = Math.max(1, parseInt(truckCapStr, 10) || 0);
+
+    if (!cleanId || !cleanPlate || !cleanModel) {
+      setBanner({ type: "error", text: "Truck Code, Plate Number, and Model are required." });
+      return;
+    }
+    if (parsedCap < 1) {
+      setBanner({ type: "error", text: "Sack capacity must be at least 1 sack." });
+      return;
+    }
+
+    setIsSavingTruck(true);
+    setBanner(null);
+
+    if (editingTruck) {
+      const res = await DataService.updateTruck(editingTruck.id, {
+        plateNumber: cleanPlate,
+        model: cleanModel,
+        capacitySacks: parsedCap,
+        sackCapacity: parsedCap
+      });
+      setIsSavingTruck(false);
+      if (res.success) {
+        setTruckModalOpen(false);
+        await reloadData(false);
+        setBanner({
+          type: "success",
+          text: `Updated ${editingTruck.id} (${cleanPlate}) capacity to ${parsedCap} sacks.`
+        });
+      } else {
+        setBanner({ type: "error", text: res.message || "Failed to update truck." });
+      }
+    } else {
+      const res = await DataService.addTruck({
         id: cleanId,
         plateNumber: cleanPlate,
-        model: newTruckModel.trim() || "Isuzu Elf",
-        capacitySacks: newTruckCapacity || 120,
-        imageUrl: newTruckPhoto || undefined,
-        status: "Available"
+        model: cleanModel,
+        capacitySacks: parsedCap,
+        sackCapacity: parsedCap
       });
-
-      setIsAddTruckOpen(false);
-      setNewTruckId("");
-      setNewTruckPlate("");
-      setNewTruckPhoto("");
-      setTruckFormError("");
-      reloadData();
-    } finally {
-      setIsSubmittingTruck(false);
+      setIsSavingTruck(false);
+      if (res.success) {
+        setTruckModalOpen(false);
+        await reloadData(false);
+        setBanner({
+          type: "success",
+          text: `Added vehicle ${cleanId} (${cleanPlate}) with ${parsedCap} sack capacity.`
+        });
+      } else {
+        setBanner({ type: "error", text: res.message || "Failed to add vehicle." });
+      }
     }
   };
 
-  const executeDeleteTruck = () => {
-    if (truckToDelete) {
-      DataService.deleteTruck(truckToDelete);
-      reloadData();
-      setTruckToDelete(null);
+  const handleSaveLocation = async (loc: Omit<DeliveryLocation, "id" | "customersCount">) => {
+    const res = await DataService.addLocation(loc);
+    if (!res.success) {
+      throw new Error(res.message || "Failed to add delivery hub.");
     }
+    await reloadData(false);
+    setBanner({ type: "success", text: `Saved Delivery Hub "${loc.name}".` });
   };
 
-  // --- LOCATION MANAGEMENT ---
-  const handleSaveLocation = async (newLoc: Omit<DeliveryLocation, "id" | "customersCount">) => {
-    DataService.addLocation(newLoc);
-    await reloadData();
-  };
+  const handleConfirmDelete = async () => {
+    if (!deleteTarget) return;
+    const { kind, id, label } = deleteTarget;
+    setDeleteTarget(null);
+    setBanner(null);
 
-  const executeDeleteLocation = async () => {
-    if (locationToDelete) {
-      DataService.deleteLocation(locationToDelete);
-      setLocationToDelete(null);
-      await reloadData();
+    const staffName = DataService.getCurrentUser()?.name || "Staff";
+    let res: { success: boolean; message: string };
+
+    if (kind === "product") {
+      res = await DataService.deleteProduct(id, staffName);
+    } else if (kind === "truck") {
+      res = await DataService.deleteTruck(id, staffName);
+    } else {
+      res = await DataService.deleteLocation(id, staffName);
+    }
+
+    if (res.success) {
+      setBanner({ type: "success", text: `Moved "${label}" to 30-day Trash Archive.` });
+      await reloadData(false);
+    } else {
+      setBanner({ type: "error", text: res.message });
     }
   };
 
   return (
-    <div className="flex flex-col gap-8 pb-16">
-      {/* Top Action Bar */}
-      <div className="flex flex-col sm:flex-row justify-between items-start sm:items-center bg-white dark:bg-slate-800 p-6 rounded-2xl border border-slate-200 dark:border-slate-700 shadow-sm gap-4">
-        <div>
-          <h2 className="text-2xl font-black text-slate-900 dark:text-white">
-            System & Operations Settings
-          </h2>
-          <p className="text-slate-500 text-sm mt-0.5">
-            Manage product catalog, wholesale rates, delivery fleet vehicles, and delivery location hubs.
-          </p>
+    <div className="space-y-6">
+      {/* Header & Section Tabs */}
+      <div className="bg-white dark:bg-slate-800 rounded-2xl border border-slate-200 dark:border-slate-700 p-4 sm:p-5 flex flex-col sm:flex-row sm:items-center justify-between gap-4 shadow-xs">
+        <div className="flex flex-wrap gap-2">
+          <button
+            type="button"
+            onClick={() => setActiveTab("products")}
+            className={`min-h-[44px] px-4 py-2 rounded-xl text-xs font-bold flex items-center gap-2 cursor-pointer transition-colors ${
+              activeTab === "products"
+                ? "bg-[#004D40] text-white"
+                : "bg-slate-100 dark:bg-slate-700 text-slate-700 dark:text-slate-200"
+            }`}
+          >
+            <Package className="w-4 h-4" />
+            <span>Products & Pricing ({products.length})</span>
+          </button>
+
+          <button
+            type="button"
+            onClick={() => setActiveTab("fleet")}
+            className={`min-h-[44px] px-4 py-2 rounded-xl text-xs font-bold flex items-center gap-2 cursor-pointer transition-colors ${
+              activeTab === "fleet"
+                ? "bg-[#004D40] text-white"
+                : "bg-slate-100 dark:bg-slate-700 text-slate-700 dark:text-slate-200"
+            }`}
+          >
+            <Truck className="w-4 h-4" />
+            <span>Fleet & Capacities ({trucks.length})</span>
+          </button>
+
+          <button
+            type="button"
+            onClick={() => setActiveTab("hubs")}
+            className={`min-h-[44px] px-4 py-2 rounded-xl text-xs font-bold flex items-center gap-2 cursor-pointer transition-colors ${
+              activeTab === "hubs"
+                ? "bg-[#004D40] text-white"
+                : "bg-slate-100 dark:bg-slate-700 text-slate-700 dark:text-slate-200"
+            }`}
+          >
+            <MapPin className="w-4 h-4" />
+            <span>Delivery Hubs ({locations.length})</span>
+          </button>
         </div>
 
         <button
-          onClick={handleSaveAll}
-          className="flex items-center gap-2 px-8 py-3 bg-[#FFD700] hover:bg-yellow-400 text-yellow-950 rounded-xl font-black shadow-lg hover:shadow-xl transition-all uppercase tracking-wider text-sm shrink-0"
+          type="button"
+          onClick={() => reloadData(true)}
+          disabled={isRefreshing}
+          className="min-h-[44px] px-4 py-2 bg-slate-100 hover:bg-slate-200 dark:bg-slate-700 dark:hover:bg-slate-600 text-slate-700 dark:text-slate-200 rounded-xl text-xs font-bold flex items-center gap-2 cursor-pointer self-start sm:self-auto"
         >
-          {saveSuccess ? (
-            <>
-              <Check className="w-5 h-5 text-emerald-800" />
-              Settings Saved!
-            </>
-          ) : (
-            <>
-              <Save className="w-5 h-5" />
-              Save All Settings
-            </>
-          )}
+          <RefreshCw className={`w-4 h-4 ${isRefreshing ? "animate-spin" : ""}`} />
+          <span>Sync All</span>
         </button>
       </div>
 
-      {/* ICE PRODUCT CATALOG & PRICING */}
-      <section className="bg-white dark:bg-slate-800 p-8 rounded-2xl border border-slate-200 dark:border-slate-700 shadow-sm">
-        <div className="flex flex-col sm:flex-row justify-between items-start sm:items-center mb-6 border-b border-slate-200 dark:border-slate-700 pb-4 gap-4">
-          <div>
-            <div className="flex items-center gap-2">
-              <Package className="w-5 h-5 text-[#00875A]" />
-              <h3 className="text-xl font-bold text-slate-900 dark:text-white">
-                Ice Products & Standard Pricing
-              </h3>
-            </div>
-            <p className="text-slate-500 text-xs mt-1">
-              Commercial ice types, sack packaging, and standard base prices.
-            </p>
-          </div>
-
-          <button
-            onClick={() => {
-              setProdFormError("");
-              setIsAddProductOpen(true);
-            }}
-            className="flex items-center gap-2 px-5 py-2.5 bg-[#00875A] hover:bg-emerald-700 text-white font-bold rounded-xl shadow-md transition-all text-sm shrink-0"
-          >
-            <Plus className="w-4 h-4" />
-            Add Ice Product
-          </button>
-        </div>
-
-        <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-4 gap-6">
-          {products.length === 0 ? (
-            <div className="col-span-full py-12 px-6 flex flex-col items-center justify-center text-center bg-slate-50 dark:bg-slate-900 border-2 border-dashed border-slate-300 dark:border-slate-700 rounded-2xl">
-              <div className="w-16 h-16 rounded-2xl bg-emerald-100 dark:bg-emerald-900/40 text-[#00875A] flex items-center justify-center mb-4">
-                <Package className="w-8 h-8" />
-              </div>
-              <h4 className="text-lg font-black text-slate-800 dark:text-slate-100">No Ice Products in Catalog Yet</h4>
-              <p className="text-sm text-slate-500 max-w-md mt-1 mb-5">
-                Your commercial catalog is currently empty. Click &quot;Add Ice Product&quot; to define your commercial ice types, sack packaging, and base pricing (e.g., Tube Ice - 50kg Big Sack @ ₱150).
-              </p>
-              <button
-                onClick={() => {
-                  setProdFormError("");
-                  setIsAddProductOpen(true);
-                }}
-                className="flex items-center gap-2 px-5 py-2.5 bg-[#00875A] hover:bg-emerald-700 text-white font-bold rounded-xl shadow-md text-sm transition-all"
-              >
-                <Plus className="w-4 h-4" />
-                Create First Ice Product
-              </button>
-            </div>
+      {banner && (
+        <div
+          className={`p-4 rounded-2xl border text-xs font-bold flex items-center gap-2 ${
+            banner.type === "success"
+              ? "bg-emerald-50 dark:bg-emerald-950/40 border-emerald-200 dark:border-emerald-800 text-emerald-800 dark:text-emerald-200"
+              : "bg-red-50 dark:bg-red-950/40 border-red-200 dark:border-red-800 text-red-700 dark:text-red-300"
+          }`}
+        >
+          {banner.type === "success" ? (
+            <CheckCircle2 className="w-4 h-4 shrink-0" />
           ) : (
-            products.map((item) => (
-            <div
-              key={item.id}
-              className="border border-slate-200 dark:border-slate-700 rounded-2xl p-5 flex flex-col justify-between bg-slate-50 dark:bg-slate-900 gap-4 group relative"
-            >
-              {/* Delete Button */}
-              <button
-                onClick={() => setProductToDelete(item.id)}
-                className="absolute top-3 right-3 p-1.5 text-slate-400 hover:text-red-600 hover:bg-red-50 dark:hover:bg-red-900/30 rounded-lg transition-colors opacity-0 group-hover:opacity-100 z-10"
-                title="Delete product"
-              >
-                <Trash2 className="w-4 h-4" />
-              </button>
-
-              {/* Product Photo / Fallback Container */}
-              <div className="w-full aspect-16/10 rounded-xl overflow-hidden bg-slate-200 dark:bg-slate-800 flex items-center justify-center relative border border-slate-200 dark:border-slate-700">
-                {item.imageUrl ? (
-                  <img
-                    src={item.imageUrl}
-                    alt={item.name}
-                    className="w-full h-full object-cover"
-                    onError={(e) => {
-                      (e.target as HTMLElement).style.display = "none";
-                    }}
-                  />
-                ) : null}
-                <div className={`w-full h-full flex flex-col items-center justify-center text-slate-400 ${item.imageUrl ? "hidden" : "flex"}`}>
-                  <Package className="w-10 h-10 text-slate-300 dark:text-slate-600" />
-                  <span className="text-[10px] font-bold uppercase tracking-wider mt-1">No Photo</span>
-                </div>
-              </div>
-
-              <div>
-                <span className="text-[10px] font-black uppercase tracking-wider px-2 py-0.5 bg-emerald-100 dark:bg-emerald-900/50 text-[#00875A] dark:text-emerald-300 rounded-full">
-                  {item.category} Ice
-                </span>
-                <h4 className="font-extrabold text-base text-slate-900 dark:text-white mt-2 truncate">
-                  {item.name}
-                </h4>
-                <p className="text-xs text-slate-400 mt-0.5">
-                  Package: <strong>{item.sackSize}</strong>
-                </p>
-              </div>
-
-              <div className="flex flex-col gap-1.5 pt-2 border-t border-slate-200 dark:border-slate-700">
-                <label className="text-[11px] font-bold text-slate-500 uppercase tracking-wider">
-                  Base Price (PHP)
-                </label>
-                <div className="relative flex items-center">
-                  <span className="absolute left-3 text-slate-400 font-bold">₱</span>
-                  <input
-                    type="number"
-                    min="10"
-                    step="5"
-                    value={item.price}
-                    onChange={(e) => handleUpdatePrice(item.id, parseFloat(e.target.value) || 0)}
-                    className="w-full pl-8 pr-3 py-2 bg-white dark:bg-slate-800 border-2 border-slate-300 dark:border-slate-600 rounded-xl focus:outline-hidden focus:border-[#00875A] text-slate-900 dark:text-white font-extrabold text-lg"
-                  />
-                </div>
-              </div>
-            </div>
-          )))}
+            <AlertTriangle className="w-4 h-4 shrink-0" />
+          )}
+          <span>{banner.text}</span>
         </div>
-      </section>
+      )}
 
-      {/* FLEET TRUCKS & DELIVERY VEHICLES */}
-      <section className="bg-white dark:bg-slate-800 p-8 rounded-2xl border border-slate-200 dark:border-slate-700 shadow-sm">
-        <div className="flex flex-col sm:flex-row justify-between items-start sm:items-center mb-6 border-b border-slate-200 dark:border-slate-700 pb-4 gap-4">
-          <div>
-            <div className="flex items-center gap-2">
-              <Truck className="w-5 h-5 text-blue-600" />
-              <h3 className="text-xl font-bold text-slate-900 dark:text-white">
-                Delivery Fleet Vehicles
+      {isLoading ? (
+        <div className="bg-white dark:bg-slate-800 rounded-2xl border border-slate-200 dark:border-slate-700 p-10 text-center text-sm text-slate-500">
+          Syncing live inventory, fleet, and hub settings...
+        </div>
+      ) : (
+        <>
+          {/* 1. PRODUCTS & PRICING */}
+          {activeTab === "products" && (
+            <div className="space-y-4">
+              <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-3">
+                <div>
+                  <h3 className="text-base font-black text-slate-900 dark:text-white">
+                    Ice Products & Wholesale Rates
+                  </h3>
+                  <p className="text-xs text-slate-500 dark:text-slate-400">
+                    Adjust prices freely (PHP 0.00+ allowed for promos/complimentary sacks). Changes apply to new Load Slips.
+                  </p>
+                </div>
+                <button
+                  type="button"
+                  onClick={openAddProductModal}
+                  className="min-h-[44px] px-4 py-2.5 bg-[#004D40] hover:bg-emerald-900 text-white font-bold text-xs rounded-xl flex items-center gap-1.5 cursor-pointer self-start"
+                >
+                  <Plus className="w-4 h-4" />
+                  <span>Add Ice Product</span>
+                </button>
+              </div>
+
+              {products.length === 0 ? (
+                <div className="bg-white dark:bg-slate-800 rounded-2xl border border-slate-200 dark:border-slate-700 p-8 text-center text-sm text-slate-500">
+                  No ice products found. Click &quot;Add Ice Product&quot; to create one.
+                </div>
+              ) : (
+                <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 gap-4">
+                  {products.map(prod => {
+                    const inputStr = priceStrMap[prod.id] ?? String(prod.price ?? 0);
+                    return (
+                      <div
+                        key={prod.id}
+                        className="bg-white dark:bg-slate-800 rounded-2xl border border-slate-200 dark:border-slate-700 p-5 space-y-4 shadow-xs"
+                      >
+                        <div className="flex items-start justify-between gap-2">
+                          <div>
+                            <span className="px-2 py-0.5 rounded-md bg-emerald-50 dark:bg-emerald-950/50 text-[#004D40] dark:text-emerald-300 text-[10px] font-black uppercase">
+                              {prod.category}
+                            </span>
+                            <h4 className="text-base font-black text-slate-900 dark:text-white mt-1">
+                              {prod.name}
+                            </h4>
+                            <p className="text-xs text-slate-500 dark:text-slate-400">
+                              Pack Size: {prod.sackSize}
+                            </p>
+                          </div>
+
+                          <div className="flex items-center gap-1">
+                            <button
+                              type="button"
+                              onClick={() => openEditProductModal(prod)}
+                              aria-label={`Edit ${prod.name}`}
+                              className="min-w-[44px] min-h-[44px] flex items-center justify-center rounded-xl text-slate-600 dark:text-slate-300 hover:bg-slate-100 dark:hover:bg-slate-700 cursor-pointer"
+                              title="Edit Product Details"
+                            >
+                              <Edit3 className="w-4 h-4" />
+                            </button>
+                            <button
+                              type="button"
+                              onClick={() =>
+                                setDeleteTarget({
+                                  kind: "product",
+                                  id: prod.id,
+                                  label: prod.name
+                                })
+                              }
+                              aria-label={`Delete ${prod.name}`}
+                              className="min-w-[44px] min-h-[44px] flex items-center justify-center rounded-xl text-red-600 hover:bg-red-50 dark:hover:bg-red-950/40 cursor-pointer"
+                              title="Move to Trash"
+                            >
+                              <Trash2 className="w-4 h-4" />
+                            </button>
+                          </div>
+                        </div>
+
+                        <div className="pt-2 border-t border-slate-100 dark:border-slate-700">
+                          <label className="block text-[11px] font-bold uppercase text-slate-500 dark:text-slate-400 mb-1.5">
+                            Standard Price (PHP / unit)
+                          </label>
+                          <div className="flex items-center gap-2">
+                            <div className="relative flex-1">
+                              <span className="absolute left-3 top-1/2 -translate-y-1/2 text-xs font-bold text-slate-400">
+                                PHP
+                              </span>
+                              <input
+                                type="text"
+                                inputMode="decimal"
+                                value={inputStr}
+                                onChange={(e) => handleCardPriceChange(prod.id, e.target.value)}
+                                onBlur={() => {
+                                  const norm = normalizePriceOnBlur(inputStr);
+                                  setPriceStrMap(prev => ({ ...prev, [prod.id]: String(norm) }));
+                                }}
+                                className="w-full min-h-[44px] pl-11 pr-3 py-2 bg-slate-50 dark:bg-slate-900/50 border border-slate-300 dark:border-slate-600 rounded-xl text-base sm:text-sm font-black text-slate-900 dark:text-white focus:outline-hidden focus:ring-2 focus:ring-[#004D40]"
+                              />
+                            </div>
+                            <button
+                              type="button"
+                              onClick={() => handleSaveCardPrice(prod)}
+                              disabled={savingPriceId === prod.id}
+                              className="min-w-[44px] min-h-[44px] px-3.5 py-2 bg-[#004D40] hover:bg-emerald-900 text-white text-xs font-bold rounded-xl flex items-center gap-1.5 cursor-pointer disabled:opacity-60"
+                            >
+                              <Save className="w-4 h-4" />
+                              <span>{savingPriceId === prod.id ? "..." : "Save"}</span>
+                            </button>
+                          </div>
+                        </div>
+                      </div>
+                    );
+                  })}
+                </div>
+              )}
+            </div>
+          )}
+
+          {/* 2. FLEET & SACK CAPACITIES */}
+          {activeTab === "fleet" && (
+            <div className="space-y-4">
+              <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-3">
+                <div>
+                  <h3 className="text-base font-black text-slate-900 dark:text-white">
+                    Fleet Vehicles & Sack Capacity Limits
+                  </h3>
+                  <p className="text-xs text-slate-500 dark:text-slate-400">
+                    Dispatchers cannot exceed a truck&apos;s maximum sack capacity across concurrent active load slips.
+                  </p>
+                </div>
+                <button
+                  type="button"
+                  onClick={openAddTruckModal}
+                  className="min-h-[44px] px-4 py-2.5 bg-[#004D40] hover:bg-emerald-900 text-white font-bold text-xs rounded-xl flex items-center gap-1.5 cursor-pointer self-start"
+                >
+                  <Plus className="w-4 h-4" />
+                  <span>Add Truck</span>
+                </button>
+              </div>
+
+              {trucks.length === 0 ? (
+                <div className="bg-white dark:bg-slate-800 rounded-2xl border border-slate-200 dark:border-slate-700 p-8 text-center text-sm text-slate-500">
+                  No delivery trucks registered. Click &quot;Add Truck&quot; to register one.
+                </div>
+              ) : (
+                <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 gap-4">
+                  {trucks.map(trk => {
+                    const capInfo = capacityList.find(c => c.truckId === trk.id);
+                    const totalCap = capInfo?.sackCapacity ?? trk.sackCapacity ?? trk.capacitySacks ?? 120;
+                    const remaining = capInfo?.remainingCapacity ?? totalCap;
+                    const used = capInfo?.usedSacks ?? 0;
+
+                    return (
+                      <div
+                        key={trk.id}
+                        className="bg-white dark:bg-slate-800 rounded-2xl border border-slate-200 dark:border-slate-700 p-5 space-y-3 shadow-xs"
+                      >
+                        <div className="flex items-start justify-between gap-2">
+                          <div>
+                            <div className="flex items-center gap-2">
+                              <span className="font-mono text-sm font-black text-[#004D40] dark:text-emerald-300">
+                                {trk.id}
+                              </span>
+                              <span className="px-2 py-0.5 rounded-full bg-slate-100 dark:bg-slate-700 text-[11px] font-bold text-slate-700 dark:text-slate-200">
+                                {trk.plateNumber}
+                              </span>
+                            </div>
+                            <h4 className="text-sm font-bold text-slate-900 dark:text-white mt-1">
+                              {trk.model}
+                            </h4>
+                          </div>
+
+                          <div className="flex items-center gap-1">
+                            <button
+                              type="button"
+                              onClick={() => openEditTruckModal(trk)}
+                              aria-label={`Edit ${trk.id}`}
+                              className="min-w-[44px] min-h-[44px] flex items-center justify-center rounded-xl text-slate-600 dark:text-slate-300 hover:bg-slate-100 dark:hover:bg-slate-700 cursor-pointer"
+                              title="Edit Truck & Capacity"
+                            >
+                              <Edit3 className="w-4 h-4" />
+                            </button>
+                            <button
+                              type="button"
+                              onClick={() =>
+                                setDeleteTarget({
+                                  kind: "truck",
+                                  id: trk.id,
+                                  label: `${trk.id} (${trk.plateNumber})`
+                                })
+                              }
+                              aria-label={`Delete ${trk.id}`}
+                              className="min-w-[44px] min-h-[44px] flex items-center justify-center rounded-xl text-red-600 hover:bg-red-50 dark:hover:bg-red-950/40 cursor-pointer"
+                              title="Move to Trash"
+                            >
+                              <Trash2 className="w-4 h-4" />
+                            </button>
+                          </div>
+                        </div>
+
+                        <div className="p-3 rounded-xl bg-slate-50 dark:bg-slate-900/50 border border-slate-200 dark:border-slate-700 text-xs space-y-1">
+                          <div className="flex items-center justify-between">
+                            <span className="text-slate-500">Max Load Capacity</span>
+                            <strong className="text-slate-900 dark:text-white">
+                              {totalCap} sacks
+                            </strong>
+                          </div>
+                          <div className="flex items-center justify-between">
+                            <span className="text-slate-500">Available Right Now</span>
+                            <strong
+                              className={
+                                remaining === 0
+                                  ? "text-red-600"
+                                  : "text-emerald-700 dark:text-emerald-400"
+                              }
+                            >
+                              {remaining} / {totalCap} ({used} active)
+                            </strong>
+                          </div>
+                        </div>
+                      </div>
+                    );
+                  })}
+                </div>
+              )}
+            </div>
+          )}
+
+          {/* 3. DELIVERY HUBS */}
+          {activeTab === "hubs" && (
+            <div className="space-y-4">
+              <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-3">
+                <div>
+                  <h3 className="text-base font-black text-slate-900 dark:text-white">
+                    Delivery Hubs & Geolocation Pins
+                  </h3>
+                  <p className="text-xs text-slate-500 dark:text-slate-400">
+                    Manage drop-off hubs across Cagayan de Oro with fast Google Maps coordinate placement.
+                  </p>
+                </div>
+                <button
+                  type="button"
+                  onClick={() => setAddLocOpen(true)}
+                  className="min-h-[44px] px-4 py-2.5 bg-[#004D40] hover:bg-emerald-900 text-white font-bold text-xs rounded-xl flex items-center gap-1.5 cursor-pointer self-start"
+                >
+                  <Plus className="w-4 h-4" />
+                  <span>Add Delivery Hub</span>
+                </button>
+              </div>
+
+              {locations.length === 0 ? (
+                <div className="bg-white dark:bg-slate-800 rounded-2xl border border-slate-200 dark:border-slate-700 p-8 text-center text-sm text-slate-500">
+                  No delivery hubs registered yet. Click &quot;Add Delivery Hub&quot; to pin your first hub.
+                </div>
+              ) : (
+                <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 gap-4">
+                  {locations.map(loc => (
+                    <div
+                      key={loc.id}
+                      className="bg-white dark:bg-slate-800 rounded-2xl border border-slate-200 dark:border-slate-700 p-5 space-y-2 shadow-xs"
+                    >
+                      <div className="flex items-start justify-between gap-2">
+                        <div>
+                          <span className="px-2 py-0.5 rounded-md bg-sky-50 dark:bg-sky-950/40 text-sky-700 dark:text-sky-300 text-[10px] font-black uppercase">
+                            {loc.zone}
+                          </span>
+                          <h4 className="text-base font-black text-slate-900 dark:text-white mt-1">
+                            {loc.name}
+                          </h4>
+                        </div>
+                        <button
+                          type="button"
+                          onClick={() =>
+                            setDeleteTarget({
+                              kind: "location",
+                              id: loc.id,
+                              label: loc.name
+                            })
+                          }
+                          aria-label={`Delete ${loc.name}`}
+                          className="min-w-[44px] min-h-[44px] flex items-center justify-center rounded-xl text-red-600 hover:bg-red-50 dark:hover:bg-red-950/40 cursor-pointer shrink-0"
+                          title="Move to Trash"
+                        >
+                          <Trash2 className="w-4 h-4" />
+                        </button>
+                      </div>
+                      <p className="text-xs text-slate-500 dark:text-slate-400">{loc.address}</p>
+                      <div className="text-[11px] font-mono text-slate-400 pt-1">
+                        {loc.latitude.toFixed(5)}, {loc.longitude.toFixed(5)}
+                      </div>
+                    </div>
+                  ))}
+                </div>
+              )}
+            </div>
+          )}
+        </>
+      )}
+
+      {/* ADD / EDIT PRODUCT MODAL */}
+      {productModalOpen && (
+        <div className="fixed inset-0 z-50 bg-black/60 backdrop-blur-xs flex items-center justify-center p-4 overflow-y-auto">
+          <div className="bg-white dark:bg-slate-900 rounded-2xl max-w-md w-full border border-slate-200 dark:border-slate-700 shadow-2xl overflow-hidden max-h-[90dvh] overflow-y-auto">
+            <div className="p-5 bg-[#004D40] text-white flex items-center justify-between">
+              <h3 className="text-lg font-black">
+                {editingProduct ? `Edit Product` : `Add New Ice Product`}
               </h3>
-            </div>
-            <p className="text-slate-500 text-xs mt-1">
-              Active JICA delivery trucks, plate numbers, and sack capacity. Add new trucks as your fleet grows.
-            </p>
-          </div>
-
-          <button
-            onClick={() => {
-              setTruckFormError("");
-              setIsAddTruckOpen(true);
-            }}
-            className="flex items-center gap-2 px-5 py-2.5 bg-blue-600 hover:bg-blue-700 text-white font-bold rounded-xl shadow-md transition-all text-sm shrink-0"
-          >
-            <Plus className="w-4 h-4" />
-            Add Delivery Truck
-          </button>
-        </div>
-
-        <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 gap-6">
-          {trucks.length === 0 ? (
-            <div className="col-span-full py-12 px-6 flex flex-col items-center justify-center text-center bg-slate-50 dark:bg-slate-900 border-2 border-dashed border-slate-300 dark:border-slate-700 rounded-2xl">
-              <div className="w-16 h-16 rounded-2xl bg-blue-100 dark:bg-blue-900/40 text-blue-600 flex items-center justify-center mb-4">
-                <Truck className="w-8 h-8" />
-              </div>
-              <h4 className="text-lg font-black text-slate-800 dark:text-slate-100">No Fleet Vehicles Registered Yet</h4>
-              <p className="text-sm text-slate-500 max-w-md mt-1 mb-5">
-                No delivery vehicles are registered in the fleet. Click &quot;Add Delivery Truck&quot; to register your trucks and sack capacities (e.g., TRK-01 / ABC-1234, Isuzu Elf).
-              </p>
               <button
-                onClick={() => {
-                  setTruckFormError("");
-                  setIsAddTruckOpen(true);
-                }}
-                className="flex items-center gap-2 px-5 py-2.5 bg-blue-600 hover:bg-blue-700 text-white font-bold rounded-xl shadow-md text-sm transition-all"
-              >
-                <Plus className="w-4 h-4" />
-                Register First Delivery Truck
-              </button>
-            </div>
-          ) : (
-            trucks.map((truck) => (
-            <div
-              key={truck.id}
-              className="border border-slate-200 dark:border-slate-700 rounded-2xl p-5 bg-slate-50 dark:bg-slate-900 flex flex-col justify-between group relative"
-            >
-              {/* Delete Button */}
-              <button
-                onClick={() => setTruckToDelete(truck.id)}
-                className="absolute top-3 right-3 p-1.5 text-slate-400 hover:text-red-600 hover:bg-red-50 dark:hover:bg-red-900/30 rounded-lg transition-colors opacity-0 group-hover:opacity-100 z-10"
-                title="Remove truck"
-              >
-                <Trash2 className="w-4 h-4" />
-              </button>
-
-              {/* Truck Photo */}
-              <div className="w-full aspect-16/10 rounded-xl overflow-hidden bg-slate-200 dark:bg-slate-800 flex items-center justify-center relative border border-slate-200 dark:border-slate-700 mb-3">
-                {truck.imageUrl ? (
-                  <img
-                    src={truck.imageUrl}
-                    alt={truck.id}
-                    className="w-full h-full object-cover"
-                    onError={(e) => {
-                      (e.target as HTMLElement).style.display = "none";
-                    }}
-                  />
-                ) : null}
-                <div className={`w-full h-full flex flex-col items-center justify-center text-slate-400 ${truck.imageUrl ? "hidden" : "flex"}`}>
-                  <Truck className="w-10 h-10 text-slate-300 dark:text-slate-600" />
-                  <span className="text-[10px] font-bold uppercase tracking-wider mt-1">Vehicle Photo</span>
-                </div>
-              </div>
-
-              <div>
-                <div className="flex items-center justify-between gap-2">
-                  <span className="text-xs font-black font-mono px-2 py-0.5 bg-blue-100 dark:bg-blue-900/50 text-blue-700 dark:text-blue-300 rounded-md">
-                    {truck.id}
-                  </span>
-                  <span className="text-xs font-mono font-bold px-2 py-0.5 bg-slate-200 dark:bg-slate-700 text-slate-800 dark:text-slate-200 rounded-md">
-                    {truck.plateNumber}
-                  </span>
-                </div>
-
-                <h4 className="font-extrabold text-base text-slate-900 dark:text-white mt-2">
-                  {truck.model}
-                </h4>
-              </div>
-
-              <div className="mt-4 pt-3 border-t border-slate-200 dark:border-slate-700 flex justify-between items-center text-xs font-bold text-slate-600 dark:text-slate-300">
-                <span>Capacity:</span>
-                <span className="text-sm font-black text-slate-900 dark:text-white">{truck.capacitySacks} Sacks</span>
-              </div>
-            </div>
-          )))}
-        </div>
-      </section>
-
-      {/* DELIVERY HUBS & LOCATION PICKER */}
-      <section className="bg-white dark:bg-slate-800 p-8 rounded-2xl border border-slate-200 dark:border-slate-700 shadow-sm">
-        <div className="flex flex-col sm:flex-row justify-between items-start sm:items-center mb-6 border-b border-slate-200 dark:border-slate-700 pb-4 gap-4">
-          <div>
-            <div className="flex items-center gap-2">
-              <MapPin className="w-5 h-5 text-[#00875A]" />
-              <h3 className="text-xl font-bold text-slate-900 dark:text-white">
-                Cagayan de Oro Delivery Location Hubs
-              </h3>
-            </div>
-            <p className="text-slate-500 text-xs mt-1">
-              Commercial hubs and malls where multiple store deliveries are grouped under 1 pin.
-            </p>
-          </div>
-
-          <button
-            onClick={() => setIsAddLocationOpen(true)}
-            className="flex items-center gap-2 px-6 py-2.5 bg-[#00875A] hover:bg-emerald-700 text-white font-bold rounded-xl shadow-md transition-all text-sm shrink-0"
-          >
-            <Plus className="w-4 h-4" />
-            Add Delivery Hub
-          </button>
-        </div>
-
-        <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 gap-4">
-          {locations.length === 0 ? (
-            <div className="col-span-full py-12 px-6 flex flex-col items-center justify-center text-center bg-slate-50 dark:bg-slate-900 border-2 border-dashed border-slate-300 dark:border-slate-700 rounded-2xl">
-              <div className="w-16 h-16 rounded-2xl bg-emerald-100 dark:bg-emerald-900/40 text-[#00875A] flex items-center justify-center mb-4">
-                <MapPin className="w-8 h-8" />
-              </div>
-              <h4 className="text-lg font-black text-slate-800 dark:text-slate-100">No Delivery Hubs Defined Yet</h4>
-              <p className="text-sm text-slate-500 max-w-md mt-1 mb-5">
-                No delivery location hubs are mapped yet. Click &quot;Add Delivery Hub&quot; to pick drop-off locations across Cagayan de Oro on Google Maps.
-              </p>
-              <button
-                onClick={() => setIsAddLocationOpen(true)}
-                className="flex items-center gap-2 px-6 py-2.5 bg-[#00875A] hover:bg-emerald-700 text-white font-bold rounded-xl shadow-md text-sm transition-all"
-              >
-                <Plus className="w-4 h-4" />
-                Add First Delivery Hub
-              </button>
-            </div>
-          ) : (
-            locations.map((loc) => (
-            <div
-              key={loc.id}
-              className="p-5 bg-slate-50 dark:bg-slate-900 border border-slate-200 dark:border-slate-700 rounded-2xl flex flex-col justify-between group hover:border-[#00875A] transition-colors"
-            >
-              <div>
-                <div className="flex justify-between items-start gap-2">
-                  <div className="flex items-center gap-2 font-bold text-slate-900 dark:text-white text-base">
-                    <MapPin className="w-4 h-4 text-[#00875A] shrink-0" />
-                    <span>{loc.name}</span>
-                  </div>
-                  <button
-                    onClick={() => setLocationToDelete(loc.id)}
-                    className="p-1.5 text-slate-400 hover:text-red-500 hover:bg-red-50 dark:hover:bg-red-900/20 rounded-lg transition-colors opacity-0 group-hover:opacity-100"
-                    title="Remove location"
-                  >
-                    <Trash2 className="w-4 h-4" />
-                  </button>
-                </div>
-                <p className="text-xs text-slate-500 mt-1 leading-relaxed">
-                  {loc.address}
-                </p>
-              </div>
-
-              <div className="mt-4 pt-3 border-t border-slate-200 dark:border-slate-800 flex justify-between items-center text-[11px] font-mono text-slate-400">
-                <span>{loc.zone}</span>
-                <span>{loc.latitude.toFixed(4)}, {loc.longitude.toFixed(4)}</span>
-              </div>
-            </div>
-          )))}
-        </div>
-      </section>
-
-      {/* INTERNAL COMPLIANCE & LEGAL POLICIES (RA 10173) */}
-      <section className="bg-white dark:bg-slate-800 p-8 rounded-2xl border border-slate-200 dark:border-slate-700 shadow-sm flex flex-col md:flex-row justify-between items-start md:items-center gap-6">
-        <div>
-          <h3 className="text-xl font-bold text-slate-900 dark:text-white flex items-center gap-2">
-            <ShieldCheck className="w-5 h-5 text-[#00875A]" />
-            Internal Privacy, Terms & Shift-Only GPS Consent
-          </h3>
-          <p className="text-slate-500 text-xs mt-1">
-            Governed under the Philippine Data Privacy Act (RA 10173). Accessible by all staff and drivers.
-          </p>
-        </div>
-
-        <div className="flex flex-wrap gap-2">
-          <button
-            onClick={() => {
-              setComplianceTab("privacy");
-              setIsComplianceOpen(true);
-            }}
-            className="px-4 py-2 bg-slate-100 dark:bg-slate-700 hover:bg-slate-200 dark:hover:bg-slate-600 rounded-xl text-xs font-bold text-slate-700 dark:text-slate-200 transition-colors"
-          >
-            Privacy Notice
-          </button>
-          <button
-            onClick={() => {
-              setComplianceTab("terms");
-              setIsComplianceOpen(true);
-            }}
-            className="px-4 py-2 bg-slate-100 dark:bg-slate-700 hover:bg-slate-200 dark:hover:bg-slate-600 rounded-xl text-xs font-bold text-slate-700 dark:text-slate-200 transition-colors"
-          >
-            Acceptable Use Terms
-          </button>
-          <button
-            onClick={() => {
-              setComplianceTab("gps");
-              setIsComplianceOpen(true);
-            }}
-            className="px-4 py-2 bg-emerald-50 dark:bg-emerald-950/40 hover:bg-emerald-100 border border-emerald-200 dark:border-emerald-800 rounded-xl text-xs font-bold text-[#00875A] dark:text-emerald-300 transition-colors"
-          >
-            Shift-Only GPS Consent
-          </button>
-        </div>
-      </section>
-
-      {/* Add Ice Product Modal */}
-      {isAddProductOpen && (
-        <div className="fixed inset-0 z-50 bg-black/60 backdrop-blur-xs flex items-center justify-center p-4">
-          <div className="bg-white dark:bg-slate-800 rounded-2xl border border-slate-200 dark:border-slate-700 shadow-2xl max-w-md w-full overflow-hidden animate-in fade-in zoom-in-95 duration-150">
-            <div className="flex items-center justify-between p-6 border-b border-slate-200 dark:border-slate-700 bg-slate-50 dark:bg-slate-900">
-              <h3 className="text-xl font-black text-slate-900 dark:text-white">
-                Add New Ice Product
-              </h3>
-              <button
-                onClick={() => setIsAddProductOpen(false)}
-                className="p-1 rounded-lg text-slate-400 hover:text-slate-600 hover:bg-slate-200 dark:hover:bg-slate-700"
+                type="button"
+                onClick={() => setProductModalOpen(false)}
+                className="min-w-[44px] min-h-[44px] flex items-center justify-center rounded-xl hover:bg-white/10 cursor-pointer"
               >
                 <X className="w-5 h-5" />
               </button>
             </div>
-
-            <form onSubmit={handleCreateProduct} className="p-6 flex flex-col gap-4">
-              {prodFormError && (
-                <div className="p-3 bg-red-50 dark:bg-red-950/50 border border-red-300 dark:border-red-800 rounded-xl text-red-700 dark:text-red-300 text-xs font-semibold flex items-center gap-2">
-                  <AlertCircle className="w-4 h-4 shrink-0" />
-                  <span>{prodFormError}</span>
-                </div>
-              )}
-
-              {/* Product Photo Device Upload */}
-              <div className="flex items-center gap-4 p-4 rounded-xl border border-slate-200 dark:border-slate-700 bg-slate-50 dark:bg-slate-900/50">
-                <div className="w-20 h-20 rounded-xl overflow-hidden border border-slate-300 dark:border-slate-600 bg-slate-200 dark:bg-slate-800 shrink-0 flex items-center justify-center relative">
-                  {newProdPhoto ? (
-                    <img src={newProdPhoto} alt="Product" className="w-full h-full object-cover" />
-                  ) : (
-                    <Package className="w-8 h-8 text-slate-400" />
-                  )}
-                </div>
-                <div className="flex flex-col gap-2">
-                  <span className="text-xs font-bold text-slate-700 dark:text-slate-300 uppercase tracking-wider">
-                    Product Picture
-                  </span>
-                  <input
-                    ref={prodFileInputRef}
-                    type="file"
-                    accept="image/*"
-                    onChange={handleProductPhotoUpload}
-                    className="hidden"
-                  />
-                  <button
-                    type="button"
-                    onClick={() => prodFileInputRef.current?.click()}
-                    className="flex items-center gap-1.5 px-3 py-1.5 bg-[#00875A] hover:bg-emerald-700 text-white rounded-lg text-xs font-bold shadow-xs transition-colors"
-                  >
-                    <Upload className="w-3.5 h-3.5" />
-                    Upload Photo
-                  </button>
-                  <p className="text-[11px] text-slate-400">
-                    Compressed to &lt;80 KB for zero-overage storage.
-                  </p>
-                </div>
-              </div>
-
-              {/* Product Name */}
+            <form onSubmit={handleSaveProductModal} className="p-5 space-y-4">
               <div>
-                <label className="block text-xs font-bold text-slate-700 dark:text-slate-300 uppercase tracking-wider mb-1">
-                  Product Name <span className="text-red-500">*</span>
+                <label className="block text-xs font-bold uppercase text-slate-600 dark:text-slate-300 mb-1.5">
+                  Product Name *
                 </label>
                 <input
                   type="text"
                   required
-                  placeholder='e.g. Tube Ice (Big Sack), Block Ice...'
-                  value={newProdName}
-                  onChange={(e) => setNewProdName(e.target.value)}
-                  className="w-full px-4 py-2.5 rounded-xl border border-slate-300 dark:border-slate-600 bg-white dark:bg-slate-900 text-slate-900 dark:text-white font-medium text-sm focus:outline-hidden focus:ring-2 focus:ring-[#00875A]"
+                  value={prodName}
+                  onChange={(e) => setProdName(e.target.value)}
+                  placeholder="Enter product name"
+                  className="w-full min-h-[44px] px-3.5 py-2 bg-slate-50 dark:bg-slate-800 border border-slate-300 dark:border-slate-700 rounded-xl text-base sm:text-sm text-slate-900 dark:text-white"
                 />
               </div>
 
-              {/* Category & Sack/Unit Size */}
-              <div className="grid grid-cols-2 gap-4">
+              <div className="grid grid-cols-2 gap-3">
                 <div>
-                  <label className="block text-xs font-bold text-slate-700 dark:text-slate-300 uppercase tracking-wider mb-1">
-                    Ice Category
+                  <label className="block text-xs font-bold uppercase text-slate-600 dark:text-slate-300 mb-1.5">
+                    Category
                   </label>
                   <select
-                    value={newProdCategory}
-                    onChange={(e) => setNewProdCategory(e.target.value as any)}
-                    className="w-full px-3.5 py-2.5 rounded-xl border border-slate-300 dark:border-slate-600 bg-white dark:bg-slate-900 text-slate-900 dark:text-white font-semibold text-sm focus:outline-hidden focus:ring-2 focus:ring-[#00875A]"
+                    value={prodCategory}
+                    onChange={(e) => setProdCategory(e.target.value as IceProduct["category"])}
+                    className="w-full min-h-[44px] px-3 py-2 bg-slate-50 dark:bg-slate-800 border border-slate-300 dark:border-slate-700 rounded-xl text-base sm:text-sm font-bold text-slate-900 dark:text-white"
                   >
-                    <option value="Tube">Tube Ice</option>
-                    <option value="Block">Block Ice</option>
-                    <option value="Crushed">Crushed Ice</option>
+                    <option value="Tube">Tube</option>
+                    <option value="Block">Block</option>
+                    <option value="Crushed">Crushed</option>
                   </select>
                 </div>
                 <div>
-                  <label className="block text-xs font-bold text-slate-700 dark:text-slate-300 uppercase tracking-wider mb-1">
+                  <label className="block text-xs font-bold uppercase text-slate-600 dark:text-slate-300 mb-1.5">
                     Sack / Unit Size
                   </label>
                   <input
                     type="text"
-                    placeholder="e.g. 50kg Big Sack, 25kg"
-                    value={newProdSackSize}
-                    onChange={(e) => setNewProdSackSize(e.target.value)}
-                    className="w-full px-3.5 py-2.5 rounded-xl border border-slate-300 dark:border-slate-600 bg-white dark:bg-slate-900 text-slate-900 dark:text-white font-medium text-sm focus:outline-hidden focus:ring-2 focus:ring-[#00875A]"
+                    value={prodSackSize}
+                    onChange={(e) => setProdSackSize(e.target.value)}
+                    placeholder="50 kg"
+                    className="w-full min-h-[44px] px-3.5 py-2 bg-slate-50 dark:bg-slate-800 border border-slate-300 dark:border-slate-700 rounded-xl text-base sm:text-sm text-slate-900 dark:text-white"
                   />
                 </div>
               </div>
 
-              {/* Base Price */}
               <div>
-                <label className="block text-xs font-bold text-slate-700 dark:text-slate-300 uppercase tracking-wider mb-1">
-                  Base Price (PHP) <span className="text-red-500">*</span>
+                <label className="block text-xs font-bold uppercase text-slate-600 dark:text-slate-300 mb-1.5">
+                  Standard Price (PHP, &gt;= 0)
                 </label>
-                <div className="relative flex items-center">
-                  <span className="absolute left-3.5 text-slate-400 font-bold">₱</span>
-                  <input
-                    type="number"
-                    min="1"
-                    step="5"
-                    value={newProdPrice}
-                    onChange={(e) => setNewProdPrice(parseFloat(e.target.value) || 0)}
-                    className="w-full pl-8 pr-4 py-2.5 rounded-xl border border-slate-300 dark:border-slate-600 bg-white dark:bg-slate-900 text-slate-900 dark:text-white font-bold text-sm focus:outline-hidden focus:ring-2 focus:ring-[#00875A]"
-                  />
-                </div>
+                <input
+                  type="text"
+                  inputMode="decimal"
+                  value={prodPriceStr}
+                  onChange={(e) => {
+                    const clean = sanitizePriceTyping(e.target.value);
+                    if (clean !== null) setProdPriceStr(clean);
+                  }}
+                  onBlur={() => setProdPriceStr(String(normalizePriceOnBlur(prodPriceStr)))}
+                  placeholder="0.00"
+                  className="w-full min-h-[44px] px-3.5 py-2 bg-slate-50 dark:bg-slate-800 border border-slate-300 dark:border-slate-700 rounded-xl text-base sm:text-sm font-black text-slate-900 dark:text-white"
+                />
               </div>
 
-              {/* Action Buttons */}
-              <div className="flex justify-end gap-3 pt-4 border-t border-slate-200 dark:border-slate-700 mt-2">
+              <div className="flex justify-end gap-2.5 pt-2">
                 <button
                   type="button"
-                  disabled={isSubmittingProduct}
-                  onClick={() => setIsAddProductOpen(false)}
-                  className="px-5 py-2.5 rounded-xl border border-slate-300 dark:border-slate-600 text-slate-700 dark:text-slate-300 font-bold text-sm hover:bg-slate-100 dark:hover:bg-slate-700 disabled:opacity-50"
+                  onClick={() => setProductModalOpen(false)}
+                  className="min-h-[44px] px-4 py-2 bg-slate-100 hover:bg-slate-200 dark:bg-slate-800 text-slate-700 dark:text-slate-200 font-bold text-sm rounded-xl cursor-pointer"
                 >
                   Cancel
                 </button>
                 <button
                   type="submit"
-                  disabled={isSubmittingProduct}
-                  className="px-6 py-2.5 rounded-xl bg-[#00875A] hover:bg-emerald-700 disabled:bg-emerald-800 text-white font-bold text-sm shadow-md transition-all flex items-center gap-2"
+                  disabled={isSavingProduct}
+                  className="min-h-[44px] px-5 py-2 bg-[#004D40] hover:bg-emerald-900 text-white font-bold text-sm rounded-xl cursor-pointer disabled:opacity-60"
                 >
-                  {isSubmittingProduct ? "Saving Product..." : "Add Product"}
+                  {isSavingProduct ? "Saving..." : "Save Product"}
                 </button>
               </div>
             </form>
@@ -787,139 +801,97 @@ export default function Settings() {
         </div>
       )}
 
-      {/* Add Truck Modal */}
-      {isAddTruckOpen && (
-        <div className="fixed inset-0 z-50 bg-black/60 backdrop-blur-xs flex items-center justify-center p-4">
-          <div className="bg-white dark:bg-slate-800 rounded-2xl border border-slate-200 dark:border-slate-700 shadow-2xl max-w-md w-full overflow-hidden animate-in fade-in zoom-in-95 duration-150">
-            <div className="flex items-center justify-between p-6 border-b border-slate-200 dark:border-slate-700 bg-slate-50 dark:bg-slate-900">
-              <h3 className="text-xl font-black text-slate-900 dark:text-white">
-                Add New Delivery Truck
+      {/* ADD / EDIT TRUCK MODAL */}
+      {truckModalOpen && (
+        <div className="fixed inset-0 z-50 bg-black/60 backdrop-blur-xs flex items-center justify-center p-4 overflow-y-auto">
+          <div className="bg-white dark:bg-slate-900 rounded-2xl max-w-md w-full border border-slate-200 dark:border-slate-700 shadow-2xl overflow-hidden max-h-[90dvh] overflow-y-auto">
+            <div className="p-5 bg-[#004D40] text-white flex items-center justify-between">
+              <h3 className="text-lg font-black">
+                {editingTruck ? `Edit Vehicle ${editingTruck.id}` : "Register Fleet Vehicle"}
               </h3>
               <button
-                onClick={() => setIsAddTruckOpen(false)}
-                className="p-1 rounded-lg text-slate-400 hover:text-slate-600 hover:bg-slate-200 dark:hover:bg-slate-700"
+                type="button"
+                onClick={() => setTruckModalOpen(false)}
+                className="min-w-[44px] min-h-[44px] flex items-center justify-center rounded-xl hover:bg-white/10 cursor-pointer"
               >
                 <X className="w-5 h-5" />
               </button>
             </div>
-
-            <form onSubmit={handleCreateTruck} className="p-6 flex flex-col gap-4">
-              {truckFormError && (
-                <div className="p-3 bg-red-50 dark:bg-red-950/50 border border-red-300 dark:border-red-800 rounded-xl text-red-700 dark:text-red-300 text-xs font-semibold flex items-center gap-2">
-                  <AlertCircle className="w-4 h-4 shrink-0" />
-                  <span>{truckFormError}</span>
-                </div>
-              )}
-
-              {/* Truck Photo Upload */}
-              <div className="flex items-center gap-4 p-4 rounded-xl border border-slate-200 dark:border-slate-700 bg-slate-50 dark:bg-slate-900/50">
-                <div className="w-20 h-20 rounded-xl overflow-hidden border border-slate-300 dark:border-slate-600 bg-slate-200 dark:bg-slate-800 shrink-0 flex items-center justify-center relative">
-                  {newTruckPhoto ? (
-                    <img src={newTruckPhoto} alt="Truck" className="w-full h-full object-cover" />
-                  ) : (
-                    <Truck className="w-8 h-8 text-slate-400" />
-                  )}
-                </div>
-                <div className="flex flex-col gap-2">
-                  <span className="text-xs font-bold text-slate-700 dark:text-slate-300 uppercase tracking-wider">
-                    Vehicle Photo
-                  </span>
-                  <input
-                    ref={truckFileInputRef}
-                    type="file"
-                    accept="image/*"
-                    onChange={handleTruckPhotoUpload}
-                    className="hidden"
-                  />
-                  <button
-                    type="button"
-                    onClick={() => truckFileInputRef.current?.click()}
-                    className="flex items-center gap-1.5 px-3 py-1.5 bg-blue-600 hover:bg-blue-700 text-white rounded-lg text-xs font-bold shadow-xs transition-colors"
-                  >
-                    <Upload className="w-3.5 h-3.5" />
-                    Upload Photo
-                  </button>
-                  <p className="text-[11px] text-slate-400">
-                    Compressed image for vehicle catalog.
-                  </p>
-                </div>
-              </div>
-
-              {/* Truck Code and Plate Number */}
-              <div className="grid grid-cols-2 gap-4">
-                <div>
-                  <label className="block text-xs font-bold text-slate-700 dark:text-slate-300 uppercase tracking-wider mb-1">
-                    Truck ID <span className="text-red-500">*</span>
-                  </label>
-                  <input
-                    type="text"
-                    required
-                    placeholder="e.g. TRK-04"
-                    value={newTruckId}
-                    onChange={(e) => setNewTruckId(e.target.value.toUpperCase())}
-                    className="w-full px-3.5 py-2.5 rounded-xl border border-slate-300 dark:border-slate-600 bg-white dark:bg-slate-900 text-slate-900 dark:text-white font-mono font-bold text-sm focus:outline-hidden focus:ring-2 focus:ring-blue-600 uppercase"
-                  />
-                </div>
-                <div>
-                  <label className="block text-xs font-bold text-slate-700 dark:text-slate-300 uppercase tracking-wider mb-1">
-                    Plate Number <span className="text-red-500">*</span>
-                  </label>
-                  <input
-                    type="text"
-                    required
-                    placeholder="e.g. KAD 5521"
-                    value={newTruckPlate}
-                    onChange={(e) => setNewTruckPlate(e.target.value.toUpperCase())}
-                    className="w-full px-3.5 py-2.5 rounded-xl border border-slate-300 dark:border-slate-600 bg-white dark:bg-slate-900 text-slate-900 dark:text-white font-mono font-bold text-sm focus:outline-hidden focus:ring-2 focus:ring-blue-600 uppercase"
-                  />
-                </div>
-              </div>
-
-              {/* Model */}
+            <form onSubmit={handleSaveTruckModal} className="p-5 space-y-4">
               <div>
-                <label className="block text-xs font-bold text-slate-700 dark:text-slate-300 uppercase tracking-wider mb-1">
-                  Vehicle Model
+                <label className="block text-xs font-bold uppercase text-slate-600 dark:text-slate-300 mb-1.5">
+                  Truck Code *
                 </label>
                 <input
                   type="text"
-                  placeholder="e.g. Isuzu Elf 14ft Aluminum Van"
-                  value={newTruckModel}
-                  onChange={(e) => setNewTruckModel(e.target.value)}
-                  className="w-full px-3.5 py-2.5 rounded-xl border border-slate-300 dark:border-slate-600 bg-white dark:bg-slate-900 text-slate-900 dark:text-white font-medium text-sm focus:outline-hidden focus:ring-2 focus:ring-blue-600"
+                  required
+                  disabled={Boolean(editingTruck)}
+                  value={truckIdInput}
+                  onChange={(e) => setTruckIdInput(e.target.value)}
+                  placeholder="Enter unique truck code"
+                  className="w-full min-h-[44px] px-3.5 py-2 bg-slate-50 dark:bg-slate-800 border border-slate-300 dark:border-slate-700 rounded-xl text-base sm:text-sm font-mono uppercase text-slate-900 dark:text-white disabled:opacity-60"
                 />
               </div>
 
-              {/* Sack Capacity */}
               <div>
-                <label className="block text-xs font-bold text-slate-700 dark:text-slate-300 uppercase tracking-wider mb-1">
-                  Max Sack Capacity
+                <label className="block text-xs font-bold uppercase text-slate-600 dark:text-slate-300 mb-1.5">
+                  Plate Number *
                 </label>
                 <input
-                  type="number"
-                  min="20"
-                  max="500"
-                  value={newTruckCapacity}
-                  onChange={(e) => setNewTruckCapacity(parseInt(e.target.value) || 100)}
-                  className="w-full px-3.5 py-2.5 rounded-xl border border-slate-300 dark:border-slate-600 bg-white dark:bg-slate-900 text-slate-900 dark:text-white font-bold text-sm focus:outline-hidden focus:ring-2 focus:ring-blue-600"
+                  type="text"
+                  required
+                  value={truckPlate}
+                  onChange={(e) => setTruckPlate(e.target.value)}
+                  placeholder="Enter license plate"
+                  className="w-full min-h-[44px] px-3.5 py-2 bg-slate-50 dark:bg-slate-800 border border-slate-300 dark:border-slate-700 rounded-xl text-base sm:text-sm uppercase text-slate-900 dark:text-white"
                 />
               </div>
 
-              {/* Action Buttons */}
-              <div className="flex justify-end gap-3 pt-4 border-t border-slate-200 dark:border-slate-700 mt-2">
+              <div>
+                <label className="block text-xs font-bold uppercase text-slate-600 dark:text-slate-300 mb-1.5">
+                  Vehicle Model *
+                </label>
+                <input
+                  type="text"
+                  required
+                  value={truckModel}
+                  onChange={(e) => setTruckModel(e.target.value)}
+                  placeholder="Enter truck make / model"
+                  className="w-full min-h-[44px] px-3.5 py-2 bg-slate-50 dark:bg-slate-800 border border-slate-300 dark:border-slate-700 rounded-xl text-base sm:text-sm text-slate-900 dark:text-white"
+                />
+              </div>
+
+              <div>
+                <label className="block text-xs font-bold uppercase text-slate-600 dark:text-slate-300 mb-1.5">
+                  Maximum Sack Capacity *
+                </label>
+                <input
+                  type="text"
+                  inputMode="numeric"
+                  required
+                  value={truckCapStr}
+                  onChange={(e) => {
+                    if (/^\d*$/.test(e.target.value)) setTruckCapStr(e.target.value);
+                  }}
+                  placeholder="120"
+                  className="w-full min-h-[44px] px-3.5 py-2 bg-slate-50 dark:bg-slate-800 border border-slate-300 dark:border-slate-700 rounded-xl text-base sm:text-sm font-black text-slate-900 dark:text-white"
+                />
+              </div>
+
+              <div className="flex justify-end gap-2.5 pt-2">
                 <button
                   type="button"
-                  disabled={isSubmittingTruck}
-                  onClick={() => setIsAddTruckOpen(false)}
-                  className="px-5 py-2.5 rounded-xl border border-slate-300 dark:border-slate-600 text-slate-700 dark:text-slate-300 font-bold text-sm hover:bg-slate-100 dark:hover:bg-slate-700 disabled:opacity-50"
+                  onClick={() => setTruckModalOpen(false)}
+                  className="min-h-[44px] px-4 py-2 bg-slate-100 hover:bg-slate-200 dark:bg-slate-800 text-slate-700 dark:text-slate-200 font-bold text-sm rounded-xl cursor-pointer"
                 >
                   Cancel
                 </button>
                 <button
                   type="submit"
-                  disabled={isSubmittingTruck}
-                  className="px-6 py-2.5 rounded-xl bg-blue-600 hover:bg-blue-700 disabled:bg-blue-800 text-white font-bold text-sm shadow-md transition-all flex items-center gap-2"
+                  disabled={isSavingTruck}
+                  className="min-h-[44px] px-5 py-2 bg-[#004D40] hover:bg-emerald-900 text-white font-bold text-sm rounded-xl cursor-pointer disabled:opacity-60"
                 >
-                  {isSubmittingTruck ? "Registering Truck..." : "Add Truck"}
+                  {isSavingTruck ? "Saving..." : "Save Vehicle"}
                 </button>
               </div>
             </form>
@@ -927,43 +899,21 @@ export default function Settings() {
         </div>
       )}
 
-      {/* Add Location Modal */}
       <AddLocationModal
-        isOpen={isAddLocationOpen}
-        onClose={() => setIsAddLocationOpen(false)}
+        isOpen={addLocOpen}
+        onClose={() => setAddLocOpen(false)}
         onSave={handleSaveLocation}
       />
 
-      {/* Delete Product Confirmation Modal */}
       <ConfirmModal
-        isOpen={!!productToDelete}
-        onConfirm={executeDeleteProduct}
-        onCancel={() => setProductToDelete(null)}
-        message="Are you sure you want to delete this ice product? This will remove it from future Load Slip options."
-      />
-
-      {/* Delete Truck Confirmation Modal */}
-      <ConfirmModal
-        isOpen={!!truckToDelete}
-        onConfirm={executeDeleteTruck}
-        onCancel={() => setTruckToDelete(null)}
-        message="Are you sure you want to remove this delivery truck from the active fleet?"
-      />
-
-      {/* Delete Delivery Location Confirmation Modal */}
-      <ConfirmModal
-        isOpen={!!locationToDelete}
-        onConfirm={executeDeleteLocation}
-        onCancel={() => setLocationToDelete(null)}
-        message="Are you sure you want to remove this delivery hub location?"
-      />
-
-      {/* Compliance Policies Modal */}
-      <ComplianceModal
-        isOpen={isComplianceOpen}
-        onClose={() => setIsComplianceOpen(false)}
-        defaultTab={complianceTab}
+        isOpen={Boolean(deleteTarget)}
+        title="Move Item to Trash?"
+        message={`Move "${deleteTarget?.label}" to the 30-day Trash Archive?`}
+        onConfirm={handleConfirmDelete}
+        onCancel={() => setDeleteTarget(null)}
       />
     </div>
   );
 }
+
+export default Settings;
