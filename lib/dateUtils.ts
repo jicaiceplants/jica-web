@@ -7,6 +7,9 @@ export const MANILA_TIMEZONE = "Asia/Manila";
  * Prevents UTC midnight rollover from shifting evening/early-morning dispatches to the wrong day.
  */
 export function getManilaDateString(dateInput: Date | string = new Date()): string {
+  if (typeof dateInput === "string" && /^\d{4}-\d{2}-\d{2}$/.test(dateInput.trim())) {
+    return dateInput.trim();
+  }
   const dateObj = typeof dateInput === "string" ? new Date(dateInput) : dateInput;
   if (Number.isNaN(dateObj.getTime())) {
     return new Intl.DateTimeFormat("en-CA", { timeZone: MANILA_TIMEZONE }).format(new Date());

@@ -4,7 +4,7 @@ import React, { useState, useEffect, useMemo, useCallback } from "react";
 import { DataService } from "@/lib/dataService";
 import { supabase } from "@/lib/supabaseClient";
 import { InvoiceRecord } from "@/lib/types";
-import { formatPhp } from "@/lib/currencyUtils";
+import { formatPhp, sumCurrency } from "@/lib/currencyUtils";
 import { formatManilaDateTime, getCurrentManilaYear, getManilaDateString } from "@/lib/dateUtils";
 import { formatProductLabel } from "@/lib/productUtils";
 import ConfirmModal from "@/components/ConfirmModal";
@@ -13,7 +13,6 @@ import {
   Search,
   Printer,
   CheckCircle2,
-  Clock,
   Banknote,
   AlertCircle,
   RefreshCw,
@@ -22,27 +21,69 @@ import {
   X,
   Truck,
   User,
-  UserCheck
+  UserCheck,
+  Calendar
 } from "lucide-react";
 
 const MONTHS = [
-  { value: "01", label: "January" },
-  { value: "02", label: "February" },
-  { value: "03", label: "March" },
-  { value: "04", label: "April" },
-  { value: "05", label: "May" },
-  { value: "06", label: "June" },
-  { value: "07", label: "July" },
-  { value: "08", label: "August" },
-  { value: "09", label: "September" },
-  { value: "10", label: "October" },
-  { value: "11", label: "November" },
-  { value: "12", label: "December" }
+  { value: "01", label: "January", short: "Jan" },
+  { value: "02", label: "February", short: "Feb" },
+  { value: "03", label: "March", short: "Mar" },
+  { value: "04", label: "April", short: "Apr" },
+  { value: "05", label: "May", short: "May" },
+  { value: "06", label: "June", short: "Jun" },
+  { value: "07", label: "July", short: "Jul" },
+  { value: "08", label: "August", short: "Aug" },
+  { value: "09", label: "September", short: "Sep" },
+  { value: "10", label: "October", short: "Oct" },
+  { value: "11", label: "November", short: "Nov" },
+  { value: "12", label: "December", short: "Dec" }
 ];
+
+type ExportPeriodMode = "today" | "week" | "month" | "year";
+
+interface MonthWeekSlice {
+  weekNumber: number;
+  startDay: number;
+  endDay: number;
+  startDateStr: string;
+  endDateStr: string;
+  label: string;
+}
+
+function getDaysInCalendarMonth(yearNum: number, monthNum: number): number {
+  return new Date(Date.UTC(yearNum, monthNum, 0)).getUTCDate();
+}
+
+function getMonthWeekSlices(yearStr: string, monthStr: string): MonthWeekSlice[] {
+  const yr = parseInt(yearStr, 10) || parseInt(getCurrentManilaYear(), 10);
+  const mo = Math.min(12, Math.max(1, parseInt(monthStr, 10) || 1));
+  const paddedMo = String(mo).padStart(2, "0");
+  const totalDays = getDaysInCalendarMonth(yr, mo);
+  const monthShort = MONTHS[mo - 1]?.short || paddedMo;
+  const slices: MonthWeekSlice[] = [];
+
+  for (let start = 1, weekIdx = 1; start <= totalDays; start += 7, weekIdx += 1) {
+    const end = Math.min(start + 6, totalDays);
+    slices.push({
+      weekNumber: weekIdx,
+      startDay: start,
+      endDay: end,
+      startDateStr: `${yr}-${paddedMo}-${String(start).padStart(2, "0")}`,
+      endDateStr: `${yr}-${paddedMo}-${String(end).padStart(2, "0")}`,
+      label: `Week ${weekIdx} (${monthShort} ${start} – ${monthShort} ${end}, ${yr})`
+    });
+  }
+  return slices;
+}
+
+function escapeCsvField(value: string | number | undefined | null): string {
+  const str = String(value ?? "");
+  return `"${str.replace(/"/g, '""')}"`;
+}
 
 type StatusFilterType =
   | "ALL"
-  | "Pending Delivery"
   | "Cash Paid"
   | "Unpaid Charge"
   | "Settled Charge";
@@ -65,6 +106,15 @@ export function Invoices() {
     action: "settle" | "delete" | null;
     invoice: InvoiceRecord | null;
   }>({ isOpen: false, action: null, invoice: null });
+
+  const [showExportModal, setShowExportModal] = useState(false);
+  const [exportPeriodMode, setExportPeriodMode] = useState<ExportPeriodMode>("today");
+  const [exportYear, setExportYear] = useState<string>(() => getCurrentManilaYear());
+  const [exportMonth, setExportMonth] = useState<string>(() => getManilaDateString().split("-")[1] || "01");
+  const [exportWeek, setExportWeek] = useState<number>(() => {
+    const day = parseInt(getManilaDateString().split("-")[2] || "1", 10) || 1;
+    return Math.min(5, Math.ceil(day / 7));
+  });
 
   const loadInvoices = useCallback(async (showSpinner = false) => {
     if (showSpinner) setIsRefreshing(true);
@@ -104,11 +154,17 @@ export function Invoices() {
   const availableYears = useMemo(() => {
     const yearSet = new Set<string>([getCurrentManilaYear()]);
     invoices.forEach(inv => {
-      const yr = (inv.date || "").split("-")[0];
+      const yr = getManilaDateString(inv.date || inv.issuedAt).split("-")[0];
       if (/^\d{4}$/.test(yr)) yearSet.add(yr);
     });
     return Array.from(yearSet).sort((a, b) => Number(b) - Number(a));
   }, [invoices]);
+
+  const exportYearOptions = useMemo(() => {
+    const currentYrNum = parseInt(getCurrentManilaYear(), 10) || 2026;
+    const yearSet = new Set<string>([String(currentYrNum), String(currentYrNum - 1), ...availableYears]);
+    return Array.from(yearSet).sort((a, b) => Number(b) - Number(a));
+  }, [availableYears]);
 
   const { results, kpi } = useMemo(() => {
     return DataService.filterAndSortInvoices({
@@ -120,6 +176,80 @@ export function Invoices() {
       statusFilter
     });
   }, [invoices, searchQuery, sortOrder, yearFilter, monthFilter, statusFilter]);
+
+  const openExportModal = () => {
+    const todayManila = getManilaDateString();
+    const [yr, mo, dy] = todayManila.split("-");
+    const dayNum = parseInt(dy || "1", 10) || 1;
+    setExportYear(yr || getCurrentManilaYear());
+    setExportMonth(mo || "01");
+    setExportWeek(Math.min(5, Math.ceil(dayNum / 7)));
+    setShowExportModal(true);
+  };
+
+  const exportMonthWeeks = useMemo(
+    () => getMonthWeekSlices(exportYear, exportMonth),
+    [exportYear, exportMonth]
+  );
+
+  const clampedExportWeek = Math.min(exportWeek, exportMonthWeeks.length || 1);
+  const activeExportWeek =
+    exportMonthWeeks.find(w => w.weekNumber === clampedExportWeek) || exportMonthWeeks[0];
+
+  const {
+    matchingExportInvoices,
+    exportPeriodLabel,
+    exportFileName,
+    exportTotalAmount
+  } = useMemo(() => {
+    const todayManila = getManilaDateString();
+    const monthMeta = MONTHS.find(m => m.value === exportMonth) || MONTHS[0];
+
+    const matched = invoices.filter(inv => {
+      const invDate = getManilaDateString(inv.date || inv.issuedAt);
+      if (exportPeriodMode === "today") {
+        return invDate === todayManila;
+      }
+      if (exportPeriodMode === "week" && activeExportWeek) {
+        return invDate >= activeExportWeek.startDateStr && invDate <= activeExportWeek.endDateStr;
+      }
+      if (exportPeriodMode === "month") {
+        return invDate.startsWith(`${exportYear}-${exportMonth}-`);
+      }
+      return invDate.startsWith(`${exportYear}-`);
+    });
+
+    const sortedMatched = [...matched].sort((a, b) => {
+      const timeA = new Date(a.issuedAt || a.date || 0).getTime();
+      const timeB = new Date(b.issuedAt || b.date || 0).getTime();
+      return timeB - timeA;
+    });
+
+    let label = "";
+    let filename = "";
+    if (exportPeriodMode === "today") {
+      const [y, m, d] = todayManila.split("-");
+      const todayMonthShort = MONTHS[(parseInt(m, 10) || 1) - 1]?.short || m;
+      label = `Today (${todayMonthShort} ${parseInt(d, 10) || d}, ${y}, Asia/Manila)`;
+      filename = `JICA_Receipts_Today_${todayManila}.csv`;
+    } else if (exportPeriodMode === "week" && activeExportWeek) {
+      label = activeExportWeek.label;
+      filename = `JICA_Receipts_${exportYear}-${exportMonth}_Week${activeExportWeek.weekNumber}.csv`;
+    } else if (exportPeriodMode === "month") {
+      label = `${monthMeta.label} ${exportYear}`;
+      filename = `JICA_Receipts_${exportYear}-${exportMonth}.csv`;
+    } else {
+      label = `Year ${exportYear}`;
+      filename = `JICA_Receipts_${exportYear}.csv`;
+    }
+
+    return {
+      matchingExportInvoices: sortedMatched,
+      exportPeriodLabel: label,
+      exportFileName: filename,
+      exportTotalAmount: sumCurrency(sortedMatched.map(r => r.totalAmount || 0))
+    };
+  }, [invoices, exportPeriodMode, exportYear, exportMonth, activeExportWeek]);
 
   const handleConfirmAction = async () => {
     const target = confirmState.invoice;
@@ -154,11 +284,13 @@ export function Invoices() {
     }
   };
 
-  const handleExportCSV = () => {
+  const handleDownloadPeriodCSV = () => {
+    if (matchingExportInvoices.length === 0) return;
+
     const headers = [
       "Invoice No",
       "Load Slip No",
-      "Date",
+      "Date (Asia/Manila)",
       "Customer",
       "Hub",
       "Truck Plate",
@@ -166,46 +298,52 @@ export function Invoices() {
       "In-Charge",
       "Product",
       "Sack Size",
-      "Planned",
-      "Delivered",
-      "Returned",
-      "Unit Price",
-      "Total Amount",
+      "Planned Sacks",
+      "Delivered Sacks",
+      "Returned Sacks",
+      "Unit Price (₱)",
+      "Total Amount (₱)",
       "Payment Type",
       "Status",
       "Settled By"
     ];
-    const rows = results.map(r => [
-      `"${r.invoiceNumber}"`,
-      `"${r.slipNumber || r.loadSlipId}"`,
-      `"${r.date}"`,
-      `"${(r.customerName || "").replace(/"/g, '""')}"`,
-      `"${(r.locationName || "").replace(/"/g, '""')}"`,
-      `"${r.truckPlate || r.truckId || ""}"`,
-      `"${(r.driverName || "").replace(/"/g, '""')}"`,
-      `"${(r.inChargeName || "").replace(/"/g, '""')}"`,
-      `"${(r.iceType || "").replace(/"/g, '""')}"`,
-      `"${r.sackSize || ""}"`,
+    const rows = matchingExportInvoices.map(r => [
+      escapeCsvField(r.invoiceNumber),
+      escapeCsvField(r.slipNumber || r.loadSlipId),
+      escapeCsvField(getManilaDateString(r.date || r.issuedAt)),
+      escapeCsvField(r.customerName),
+      escapeCsvField(r.locationName),
+      escapeCsvField(r.truckPlate || r.truckId || ""),
+      escapeCsvField(r.driverName),
+      escapeCsvField(r.inChargeName),
+      escapeCsvField(r.iceType),
+      escapeCsvField(r.sackSize),
       r.plannedQty ?? r.deliveredQty,
       r.deliveredQty,
       r.returnedQty ?? Math.max(0, (r.plannedQty ?? r.deliveredQty) - r.deliveredQty),
       r.unitPrice.toFixed(2),
       r.totalAmount.toFixed(2),
-      `"${r.paymentType}"`,
-      `"${r.status}"`,
-      `"${r.settledBy || ""}"`
+      escapeCsvField(r.paymentType),
+      escapeCsvField(r.status),
+      escapeCsvField(r.settledBy || "")
     ]);
 
-    const csv = [headers.join(","), ...rows.map(r => r.join(","))].join("\n");
-    const blob = new Blob([csv], { type: "text/csv;charset=utf-8;" });
+    const csv = [headers.map(h => escapeCsvField(h)).join(","), ...rows.map(r => r.join(","))].join("\n");
+    // Prepend UTF-8 BOM (\uFEFF) so Excel opens ₱ currency symbols accurately
+    const blob = new Blob(["\uFEFF" + csv], { type: "text/csv;charset=utf-8;" });
     const url = URL.createObjectURL(blob);
     const link = document.createElement("a");
     link.href = url;
-    link.download = `JICA_Invoices_${getManilaDateString()}.csv`;
+    link.download = exportFileName;
     document.body.appendChild(link);
     link.click();
     document.body.removeChild(link);
     URL.revokeObjectURL(url);
+    setShowExportModal(false);
+    setFeedback({
+      type: "success",
+      text: `Downloaded ${matchingExportInvoices.length} approved receipt${matchingExportInvoices.length === 1 ? "" : "s"} (${exportFileName}).`
+    });
   };
 
   const renderStatusBadge = (status: InvoiceRecord["status"]) => {
@@ -223,15 +361,10 @@ export function Invoices() {
           </span>
         );
       case "Unpaid Charge":
+      default:
         return (
           <span className="px-2.5 py-1 rounded-full text-[11px] font-bold bg-amber-100 text-amber-800 dark:bg-amber-900/40 dark:text-amber-300">
             Unpaid Charge
-          </span>
-        );
-      default:
-        return (
-          <span className="px-2.5 py-1 rounded-full text-[11px] font-bold bg-blue-100 text-blue-700 dark:bg-blue-900/40 dark:text-blue-300">
-            Pending Delivery
           </span>
         );
     }
@@ -239,7 +372,7 @@ export function Invoices() {
 
   return (
     <div className="space-y-6">
-      {/* KPI Cards */}
+      {/* KPI Cards (Approved & Remitted Receipts Only) */}
       <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-4 gap-4">
         <div className="bg-white dark:bg-slate-800 rounded-2xl border border-slate-200 dark:border-slate-700 p-4 shadow-xs">
           <div className="flex items-center justify-between text-xs font-bold uppercase text-slate-500 dark:text-slate-400">
@@ -269,27 +402,27 @@ export function Invoices() {
 
         <div className="bg-white dark:bg-slate-800 rounded-2xl border border-slate-200 dark:border-slate-700 p-4 shadow-xs">
           <div className="flex items-center justify-between text-xs font-bold uppercase text-slate-500 dark:text-slate-400">
-            <span>In-Transit / Pending Drop</span>
-            <Clock className="w-4 h-4 text-blue-600" />
+            <span>Settled Charge Invoices</span>
+            <CheckCircle2 className="w-4 h-4 text-teal-600" />
           </div>
-          <div className="text-2xl font-black text-blue-600 dark:text-blue-400 mt-1.5">
-            PHP {formatPhp(kpi.totalPendingDelivery)}
+          <div className="text-2xl font-black text-teal-700 dark:text-teal-400 mt-1.5">
+            PHP {formatPhp(kpi.totalSettledCharge)}
           </div>
           <div className="text-[11px] text-slate-400 mt-0.5">
-            {kpi.countPending} pre-dispatched receipt{kpi.countPending === 1 ? "" : "s"}
+            {kpi.countSettled} settled charge receipt{kpi.countSettled === 1 ? "" : "s"}
           </div>
         </div>
 
         <div className="bg-white dark:bg-slate-800 rounded-2xl border border-slate-200 dark:border-slate-700 p-4 shadow-xs">
           <div className="flex items-center justify-between text-xs font-bold uppercase text-slate-500 dark:text-slate-400">
-            <span>Total Billed Gross</span>
+            <span>Approved Billed Gross</span>
             <FileText className="w-4 h-4 text-[#004D40] dark:text-emerald-400" />
           </div>
           <div className="text-2xl font-black text-slate-900 dark:text-white mt-1.5">
             PHP {formatPhp(kpi.totalOverall)}
           </div>
           <div className="text-[11px] text-slate-400 mt-0.5">
-            Across {invoices.length} official record{invoices.length === 1 ? "" : "s"}
+            Across {invoices.length} remitted receipt{invoices.length === 1 ? "" : "s"}
           </div>
         </div>
       </div>
@@ -368,7 +501,7 @@ export function Invoices() {
 
             <button
               type="button"
-              onClick={handleExportCSV}
+              onClick={openExportModal}
               className="min-h-[44px] px-3.5 py-2 bg-[#004D40] hover:bg-emerald-900 text-white rounded-xl text-xs font-bold flex items-center gap-1.5 cursor-pointer"
             >
               <Download className="w-4 h-4" />
@@ -378,7 +511,7 @@ export function Invoices() {
         </div>
 
         <div className="flex flex-wrap gap-2">
-          {(["ALL", "Pending Delivery", "Unpaid Charge", "Settled Charge", "Cash Paid"] as StatusFilterType[]).map(
+          {(["ALL", "Cash Paid", "Unpaid Charge", "Settled Charge"] as StatusFilterType[]).map(
             tab => (
               <button
                 key={tab}
@@ -389,7 +522,7 @@ export function Invoices() {
                   : "bg-slate-100 dark:bg-slate-700 text-slate-600 dark:text-slate-300 hover:bg-slate-200 dark:hover:bg-slate-600"
                   }`}
               >
-                {tab === "ALL" ? "All Receipts" : tab}
+                {tab === "ALL" ? "All Approved Receipts" : tab}
               </button>
             )
           )}
@@ -400,11 +533,11 @@ export function Invoices() {
       <div className="bg-white dark:bg-slate-800 rounded-2xl border border-slate-200 dark:border-slate-700 shadow-xs overflow-hidden">
         {isLoading ? (
           <div className="p-10 text-center text-sm text-slate-500 dark:text-slate-400">
-            Loading official receipts and invoices...
+            Loading approved official receipts and invoices...
           </div>
         ) : results.length === 0 ? (
           <div className="p-10 text-center text-sm text-slate-500 dark:text-slate-400">
-            No matching invoices found. Dispatch a Load Slip to auto-generate receipts.
+            No approved receipts found. Complete delivery and approve remittance in Shift Closing to publish receipts here.
           </div>
         ) : (
           <div className="overflow-x-auto scroll-touch">
@@ -662,6 +795,175 @@ export function Invoices() {
                   className="min-h-[44px] px-4 py-2.5 bg-slate-100 hover:bg-slate-200 dark:bg-slate-800 dark:hover:bg-slate-700 text-slate-700 dark:text-slate-200 font-bold rounded-xl cursor-pointer"
                 >
                   Close
+                </button>
+              </div>
+            </div>
+          </div>
+        </div>
+      )}
+
+      {/* Flexible Manila Period Export CSV Modal (PC, Laptop & iPad Safari Safe) */}
+      {showExportModal && (
+        <div className="fixed inset-0 z-50 bg-black/60 backdrop-blur-xs flex items-center justify-center p-4 overflow-y-auto">
+          <div className="bg-white dark:bg-slate-900 rounded-2xl max-w-lg w-full border border-slate-200 dark:border-slate-700 shadow-2xl overflow-hidden max-h-[90dvh] overflow-y-auto">
+            <div className="p-5 bg-[#004D40] text-white flex items-center justify-between">
+              <div className="flex items-center gap-2.5">
+                <Calendar className="w-5 h-5 text-emerald-200 shrink-0" />
+                <div>
+                  <h3 className="text-base font-black tracking-tight">Export Official Receipts (CSV)</h3>
+                  <p className="text-[11px] text-emerald-100">
+                    Approved &amp; remitted receipts filtered in Asia/Manila (UTC+8)
+                  </p>
+                </div>
+              </div>
+              <button
+                type="button"
+                onClick={() => setShowExportModal(false)}
+                aria-label="Close Export Modal"
+                className="min-w-[44px] min-h-[44px] flex items-center justify-center rounded-xl text-white/80 hover:text-white hover:bg-white/10 cursor-pointer"
+              >
+                <X className="w-5 h-5" />
+              </button>
+            </div>
+
+            <div className="p-5 space-y-5">
+              {/* Period Mode Selector Tabs */}
+              <div>
+                <label className="block text-[11px] font-black uppercase tracking-wider text-slate-500 dark:text-slate-400 mb-2">
+                  Select Reporting Period
+                </label>
+                <div className="grid grid-cols-2 sm:grid-cols-4 gap-2">
+                  {(
+                    [
+                      { id: "today", label: "Today" },
+                      { id: "week", label: "Week" },
+                      { id: "month", label: "Month" },
+                      { id: "year", label: "Year" }
+                    ] as { id: ExportPeriodMode; label: string }[]
+                  ).map(opt => (
+                    <button
+                      key={opt.id}
+                      type="button"
+                      onClick={() => setExportPeriodMode(opt.id)}
+                      className={`min-h-[44px] px-3 py-2 rounded-xl text-xs font-black transition-all cursor-pointer ${
+                        exportPeriodMode === opt.id
+                          ? "bg-[#004D40] text-white shadow-sm"
+                          : "bg-slate-100 dark:bg-slate-800 text-slate-700 dark:text-slate-200 hover:bg-slate-200 dark:hover:bg-slate-700"
+                      }`}
+                    >
+                      {opt.label}
+                    </button>
+                  ))}
+                </div>
+              </div>
+
+              {/* Conditional Period Selectors (Touch-Friendly Dropdowns — No input[type=week]) */}
+              {exportPeriodMode === "today" && (
+                <div className="p-3.5 rounded-xl bg-slate-50 dark:bg-slate-800/80 border border-slate-200 dark:border-slate-700 text-xs text-slate-600 dark:text-slate-300">
+                  Exports all approved receipts dated <strong className="text-slate-900 dark:text-white">{getManilaDateString()}</strong> in Asia/Manila time.
+                </div>
+              )}
+
+              {(exportPeriodMode === "week" || exportPeriodMode === "month" || exportPeriodMode === "year") && (
+                <div className="grid grid-cols-1 sm:grid-cols-2 gap-3">
+                  <div>
+                    <label className="block text-[11px] font-bold uppercase text-slate-500 dark:text-slate-400 mb-1.5">
+                      Year
+                    </label>
+                    <select
+                      value={exportYear}
+                      onChange={(e) => setExportYear(e.target.value)}
+                      className="w-full min-h-[44px] px-3 py-2 bg-slate-50 dark:bg-slate-800 border border-slate-300 dark:border-slate-600 rounded-xl text-base sm:text-xs font-bold text-slate-800 dark:text-white"
+                    >
+                      {exportYearOptions.map(yr => (
+                        <option key={yr} value={yr}>
+                          {yr}
+                        </option>
+                      ))}
+                    </select>
+                  </div>
+
+                  {(exportPeriodMode === "week" || exportPeriodMode === "month") && (
+                    <div>
+                      <label className="block text-[11px] font-bold uppercase text-slate-500 dark:text-slate-400 mb-1.5">
+                        Month
+                      </label>
+                      <select
+                        value={exportMonth}
+                        onChange={(e) => setExportMonth(e.target.value)}
+                        className="w-full min-h-[44px] px-3 py-2 bg-slate-50 dark:bg-slate-800 border border-slate-300 dark:border-slate-600 rounded-xl text-base sm:text-xs font-bold text-slate-800 dark:text-white"
+                      >
+                        {MONTHS.map(m => (
+                          <option key={m.value} value={m.value}>
+                            {m.label}
+                          </option>
+                        ))}
+                      </select>
+                    </div>
+                  )}
+
+                  {exportPeriodMode === "week" && (
+                    <div className="sm:col-span-2">
+                      <label className="block text-[11px] font-bold uppercase text-slate-500 dark:text-slate-400 mb-1.5">
+                        Week Range
+                      </label>
+                      <select
+                        value={clampedExportWeek}
+                        onChange={(e) => setExportWeek(Number(e.target.value))}
+                        className="w-full min-h-[44px] px-3 py-2 bg-slate-50 dark:bg-slate-800 border border-slate-300 dark:border-slate-600 rounded-xl text-base sm:text-xs font-bold text-slate-800 dark:text-white"
+                      >
+                        {exportMonthWeeks.map(w => (
+                          <option key={w.weekNumber} value={w.weekNumber}>
+                            {w.label}
+                          </option>
+                        ))}
+                      </select>
+                    </div>
+                  )}
+                </div>
+              )}
+
+              {/* Live Match Count & Total Preview */}
+              <div
+                className={`p-4 rounded-xl border ${
+                  matchingExportInvoices.length > 0
+                    ? "bg-emerald-50 dark:bg-emerald-950/30 border-emerald-200 dark:border-emerald-800"
+                    : "bg-amber-50 dark:bg-amber-950/30 border-amber-200 dark:border-amber-800"
+                }`}
+              >
+                <div className="text-xs font-black text-slate-900 dark:text-white">
+                  {matchingExportInvoices.length > 0
+                    ? `${matchingExportInvoices.length} approved receipt${matchingExportInvoices.length === 1 ? "" : "s"} found for ${exportPeriodLabel}`
+                    : `No approved receipts found for ${exportPeriodLabel}`}
+                </div>
+                {matchingExportInvoices.length > 0 ? (
+                  <div className="text-[11px] text-emerald-700 dark:text-emerald-300 mt-1 flex flex-wrap items-center justify-between gap-2">
+                    <span>Total Amount: <strong>PHP {formatPhp(exportTotalAmount)}</strong></span>
+                    <span className="font-mono text-[10px] opacity-80">{exportFileName}</span>
+                  </div>
+                ) : (
+                  <div className="text-[11px] text-amber-700 dark:text-amber-300 mt-1">
+                    Select another period with remitted deliveries to enable CSV download.
+                  </div>
+                )}
+              </div>
+
+              <div className="flex flex-wrap justify-end gap-2 pt-1">
+                <button
+                  type="button"
+                  onClick={() => setShowExportModal(false)}
+                  className="min-h-[44px] px-4 py-2.5 bg-slate-100 hover:bg-slate-200 dark:bg-slate-800 dark:hover:bg-slate-700 text-slate-700 dark:text-slate-200 text-xs font-bold rounded-xl cursor-pointer"
+                >
+                  Cancel
+                </button>
+                <button
+                  type="button"
+                  onClick={handleDownloadPeriodCSV}
+                  disabled={matchingExportInvoices.length === 0}
+                  className="min-h-[44px] px-5 py-2.5 bg-[#004D40] hover:bg-emerald-900 disabled:bg-slate-300 disabled:text-slate-500 dark:disabled:bg-slate-700 dark:disabled:text-slate-400 text-white text-xs font-black rounded-xl flex items-center gap-2 cursor-pointer disabled:cursor-not-allowed transition-colors"
+                >
+                  <Download className="w-4 h-4" />
+                  <span>Download CSV</span>
                 </button>
               </div>
             </div>

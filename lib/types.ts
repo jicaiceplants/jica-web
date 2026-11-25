@@ -164,6 +164,7 @@ export interface InvoiceRecord {
   totalAmount: number;
   paymentType: "Cash" | "Charge Invoice";
   status: "Pending Delivery" | "Cash Paid" | "Unpaid Charge" | "Settled Charge";
+  loadSlipStatus?: string;
   settledAt?: string;
   settledBy?: string;
 }

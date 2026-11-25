@@ -129,13 +129,33 @@ function mapDbSlipToWeb(s: any, usersById?: Map<string, UserAccount>, trucksById
   };
 }
 
+const APPROVED_SLIP_STATUSES = new Set(["REMITTED", "COMPLETED", "RECONCILED"]);
+
+function isApprovedRemittedInvoice(inv: any): boolean {
+  if (!inv) return false;
+  const slipStatus = String(
+    inv.load_slip_status ?? inv.loadSlipStatus ?? inv.load_slips?.status ?? ""
+  )
+    .trim()
+    .toUpperCase();
+  const invStatus = String(inv.status || "").trim();
+  if (!APPROVED_SLIP_STATUSES.has(slipStatus)) return false;
+  return invStatus !== "Pending Delivery";
+}
+
 function mapDbInvoiceToWeb(inv: any): InvoiceRecord {
   const slipMeta = inv.load_slips || {};
-  const rawStatus = String(inv.status || "Pending Delivery");
-  let mappedStatus: InvoiceRecord["status"] = "Pending Delivery";
+  const slipStatus = String(
+    inv.load_slip_status || slipMeta.status || ""
+  )
+    .trim()
+    .toUpperCase();
+  const rawStatus = String(inv.status || "");
+  let mappedStatus: InvoiceRecord["status"] = "Cash Paid";
   if (rawStatus === "Cash Paid") mappedStatus = "Cash Paid";
   else if (rawStatus === "Unpaid Charge") mappedStatus = "Unpaid Charge";
   else if (rawStatus === "Settled" || rawStatus === "Settled Charge") mappedStatus = "Settled Charge";
+  else if (inv.payment_type === "Charge") mappedStatus = "Unpaid Charge";
 
   return {
     id: inv.id,
@@ -160,6 +180,7 @@ function mapDbInvoiceToWeb(inv: any): InvoiceRecord {
     totalAmount: roundCurrency(inv.total_amount),
     paymentType: inv.payment_type === "Charge" ? "Charge Invoice" : "Cash",
     status: mappedStatus,
+    loadSlipStatus: slipStatus,
     settledAt: inv.settled_at ? formatManilaDateTime(inv.settled_at) : undefined,
     settledBy: inv.settled_by || undefined
   };
@@ -1565,10 +1586,10 @@ export class DataService {
     return { results: sorted, kpi };
   }
 
-  // --- INVOICES & COLLECTIONS LEDGER ---
+  // --- INVOICES & COLLECTIONS LEDGER (APPROVED / REMITTED ONLY) ---
   static getInvoices(): InvoiceRecord[] {
     const invs = getStorageItem<InvoiceRecord[]>(STORAGE_KEYS.INVOICES, []);
-    return Array.isArray(invs) ? invs : [];
+    return Array.isArray(invs) ? invs.filter(isApprovedRemittedInvoice) : [];
   }
 
   static async fetchInvoicesLive(): Promise<InvoiceRecord[]> {
@@ -1576,7 +1597,7 @@ export class DataService {
       const res = await this.authorizedFetch(`${BACKEND_URL}/api/v1/invoices`);
       if (res.ok) {
         const json = await res.json();
-        const mapped = (json.data || []).map(mapDbInvoiceToWeb);
+        const mapped = (json.data || []).filter(isApprovedRemittedInvoice).map(mapDbInvoiceToWeb);
         setStorageItem(STORAGE_KEYS.INVOICES, mapped);
         return mapped;
       }
@@ -1591,7 +1612,7 @@ export class DataService {
       .order("created_at", { ascending: false });
 
     if (!error && data) {
-      const mapped = data.map(mapDbInvoiceToWeb);
+      const mapped = data.filter(isApprovedRemittedInvoice).map(mapDbInvoiceToWeb);
       setStorageItem(STORAGE_KEYS.INVOICES, mapped);
       return mapped;
     }
@@ -1647,9 +1668,9 @@ export class DataService {
     sortOrder: "latest" | "oldest";
     yearFilter?: string;
     monthFilter?: string;
-    statusFilter: "ALL" | "Pending Delivery" | "Cash Paid" | "Unpaid Charge" | "Settled Charge";
+    statusFilter: "ALL" | "Cash Paid" | "Unpaid Charge" | "Settled Charge";
   }) {
-    const safeInvoices = Array.isArray(invoices) ? invoices : [];
+    const safeInvoices = Array.isArray(invoices) ? invoices.filter(isApprovedRemittedInvoice) : [];
     const normalizedQuery = (searchQuery || "").trim().toLowerCase();
 
     const filtered = safeInvoices.filter(inv => {
@@ -1682,11 +1703,9 @@ export class DataService {
     let totalCashCents = 0;
     let totalUnpaidCents = 0;
     let totalSettledCents = 0;
-    let totalPendingCents = 0;
     let countCash = 0;
     let countUnpaid = 0;
     let countSettled = 0;
-    let countPending = 0;
 
     for (const inv of safeInvoices) {
       if (!inv) continue;
@@ -1701,9 +1720,6 @@ export class DataService {
         totalSettledCents += cents;
         totalCashCents += cents;
         countSettled += 1;
-      } else {
-        totalPendingCents += cents;
-        countPending += 1;
       }
     }
 
@@ -1713,12 +1729,10 @@ export class DataService {
         totalCashCollected: totalCashCents / 100,
         totalUnpaidCharge: totalUnpaidCents / 100,
         totalSettledCharge: totalSettledCents / 100,
-        totalPendingDelivery: totalPendingCents / 100,
-        totalOverall: (totalCashCents + totalUnpaidCents + totalPendingCents) / 100,
+        totalOverall: (totalCashCents + totalUnpaidCents) / 100,
         countUnpaid,
         countSettled,
-        countCash,
-        countPending
+        countCash
       }
     };
   }

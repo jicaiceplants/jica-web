@@ -132,11 +132,10 @@ export function LiveFleetTracking() {
 
       {banner && (
         <div
-          className={`p-4 rounded-2xl border text-xs font-bold flex items-center gap-2 ${
-            banner.type === "success"
-              ? "bg-emerald-50 dark:bg-emerald-950/40 border-emerald-200 dark:border-emerald-800 text-emerald-800 dark:text-emerald-200"
-              : "bg-red-50 dark:bg-red-950/40 border-red-200 dark:border-red-800 text-red-700 dark:text-red-300"
-          }`}
+          className={`p-4 rounded-2xl border text-xs font-bold flex items-center gap-2 ${banner.type === "success"
+            ? "bg-emerald-50 dark:bg-emerald-950/40 border-emerald-200 dark:border-emerald-800 text-emerald-800 dark:text-emerald-200"
+            : "bg-red-50 dark:bg-red-950/40 border-red-200 dark:border-red-800 text-red-700 dark:text-red-300"
+            }`}
         >
           {banner.type === "success" ? (
             <CheckCircle2 className="w-4 h-4 shrink-0" />
@@ -180,20 +179,18 @@ export function LiveFleetTracking() {
                   <div
                     key={trk.truckId}
                     onClick={() => setSelectedTruckId(trk.truckId)}
-                    className={`p-4 rounded-2xl border transition-all cursor-pointer ${
-                      isAlert
-                        ? "bg-red-50 dark:bg-red-950/30 border-red-300 dark:border-red-800"
-                        : isSelected
+                    className={`p-4 rounded-2xl border transition-all cursor-pointer ${isAlert
+                      ? "bg-red-50 dark:bg-red-950/30 border-red-300 dark:border-red-800"
+                      : isSelected
                         ? "bg-emerald-50/70 dark:bg-emerald-950/30 border-[#004D40] dark:border-emerald-600"
                         : "bg-white dark:bg-slate-800 border-slate-200 dark:border-slate-700"
-                    }`}
+                      }`}
                   >
                     <div className="flex items-center justify-between gap-2">
                       <div className="flex items-center gap-2">
                         <Truck
-                          className={`w-4 h-4 ${
-                            isAlert ? "text-red-600" : "text-[#004D40] dark:text-emerald-400"
-                          }`}
+                          className={`w-4 h-4 ${isAlert ? "text-red-600" : "text-[#004D40] dark:text-emerald-400"
+                            }`}
                         />
                         <strong className="text-sm font-black text-slate-900 dark:text-white">
                           {trk.truckId}
@@ -201,13 +198,12 @@ export function LiveFleetTracking() {
                         <span className="text-xs text-slate-500">{trk.truckPlate}</span>
                       </div>
                       <span
-                        className={`px-2 py-0.5 rounded-full text-[10px] font-black uppercase ${
-                          isAlert
-                            ? "bg-red-600 text-white animate-pulse"
-                            : trk.status === "Idle"
+                        className={`px-2 py-0.5 rounded-full text-[10px] font-black uppercase ${isAlert
+                          ? "bg-red-600 text-white animate-pulse"
+                          : trk.status === "Idle"
                             ? "bg-slate-200 text-slate-700 dark:bg-slate-700 dark:text-slate-200"
                             : "bg-emerald-100 text-emerald-700 dark:bg-emerald-900/40 dark:text-emerald-300"
-                        }`}
+                          }`}
                       >
                         {trk.status}
                       </span>
@@ -238,16 +234,46 @@ export function LiveFleetTracking() {
                           <Siren className="w-4 h-4" />
                           <span>SOS: {trk.sosAlert.reason}</span>
                         </div>
-                        <button
-                          type="button"
-                          onClick={(e) => {
-                            e.stopPropagation();
-                            handleDispatchRescue(trk);
-                          }}
-                          className="w-full min-h-[44px] py-2 px-3 bg-red-600 hover:bg-red-700 text-white font-black text-xs rounded-xl cursor-pointer"
-                        >
-                          Send Rescue Acknowledgment
-                        </button>
+                        <div className="flex flex-col sm:flex-row gap-2">
+                          <button
+                            type="button"
+                            onClick={(e) => {
+                              e.stopPropagation();
+                              handleDispatchRescue(trk);
+                            }}
+                            className="flex-1 min-h-[44px] py-2 px-3 bg-red-600 hover:bg-red-700 text-white font-black text-xs rounded-xl cursor-pointer"
+                          >
+                            {trk.sosAlert.dispatchedRescue ? "Rescue Dispatched ✓" : "Send Rescue Acknowledgment"}
+                          </button>
+                          <button
+                            type="button"
+                            onClick={async (e) => {
+                              e.stopPropagation();
+                              const currentUser = DataService.getCurrentUser();
+                              try {
+                                await fetch(`${BACKEND_URL}/api/v1/telemetry/sos/resolve`, {
+                                  method: "POST",
+                                  headers: DataService.getAuthHeaders(),
+                                  body: JSON.stringify({
+                                    truck_id: trk.truckId,
+                                    driver_id: trk.driverId,
+                                    resolved_by: currentUser?.name || "Dispatch Desk"
+                                  })
+                                });
+                              } catch {
+                                // non-fatal
+                              }
+                              setBanner({
+                                type: "success",
+                                text: `SOS alert resolved for ${trk.truckId}.`
+                              });
+                              await loadLiveFleet(false);
+                            }}
+                            className="min-h-[44px] py-2 px-3 bg-emerald-600 hover:bg-emerald-700 text-white font-bold text-xs rounded-xl cursor-pointer"
+                          >
+                            Resolve SOS
+                          </button>
+                        </div>
                       </div>
                     )}
                   </div>

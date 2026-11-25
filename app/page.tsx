@@ -283,7 +283,10 @@ export default function DispatchDashboard() {
         const res = await fetch(`${BACKEND_URL}/api/v1/telemetry/sos/active`);
         if (res.ok) {
           const data = await res.json();
-          const alerts: ActiveSosAlert[] = data.alerts || [];
+          const alerts: ActiveSosAlert[] = (data.alerts || []).filter((a: any) => {
+            const st = String(a?.status || "").toUpperCase();
+            return st !== "RESOLVED" && st !== "DISMISSED";
+          });
           const activeUnack = alerts.find(a => a.status === "Active" && !dismissedAlertIds.has(a.id));
 
           if (activeUnack) {
@@ -316,6 +319,31 @@ export default function DispatchDashboard() {
       setDismissedAlertIds(prev => new Set(prev).add(activeSosModal.id));
     }
     setActiveSosModal(null);
+  };
+
+  const handleResolveSos = async () => {
+    if (!activeSosModal) return;
+    setIsSendingReply(true);
+    try {
+      await fetch(`${BACKEND_URL}/api/v1/telemetry/sos/resolve`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          alert_id: activeSosModal.id,
+          idempotency_key: activeSosModal.id,
+          driver_id: activeSosModal.driver_id,
+          truck_id: activeSosModal.truck_id,
+          resolved_by: currentUser?.name || "Office Dispatcher"
+        })
+      });
+    } catch {
+      // silent catch
+    } finally {
+      audioAlarm.stop();
+      setDismissedAlertIds(prev => new Set(prev).add(activeSosModal.id));
+      setActiveSosModal(null);
+      setIsSendingReply(false);
+    }
   };
 
   const handleViewOnFleetMap = () => {
@@ -639,6 +667,16 @@ export default function DispatchDashboard() {
                 >
                   <MapPin className="w-4 h-4" />
                   <span>View on Fleet Map</span>
+                </button>
+
+                <button
+                  type="button"
+                  onClick={handleResolveSos}
+                  disabled={isSendingReply}
+                  className="min-h-[44px] py-3 px-4 bg-emerald-600 hover:bg-emerald-700 text-white font-bold text-xs rounded-xl transition-all flex items-center justify-center gap-2 cursor-pointer disabled:opacity-60"
+                >
+                  <CheckCircle2 className="w-4 h-4" />
+                  <span>Mark Resolved</span>
                 </button>
               </div>
             </div>
