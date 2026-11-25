@@ -14,6 +14,7 @@ import {
 import { supabase } from "./supabaseClient";
 import { getManilaDateString, getManilaTimeString, formatManilaDateTime } from "./dateUtils";
 import { roundCurrency, multiplyCurrency, sumCurrency } from "./currencyUtils";
+import { sanitizeStoredImageUrl, deleteStorageImage } from "./imageUpload";
 
 const BACKEND_URL = (process.env.NEXT_PUBLIC_BACKEND_URL || "https://jica-backend-production.up.railway.app")
   .replace(/\/+$/, "")
@@ -318,13 +319,45 @@ export class DataService {
   static async fetchLiveFromSupabase(): Promise<{ success: boolean; error?: string }> {
     try {
       const [prodsRes, trucksRes, hubsRes, custsRes, usersRes, invRes, slipsRes] = await Promise.all([
-        supabase.from("products").select("*").eq("is_active", true).is("deleted_at", null).order("created_at", { ascending: true }),
-        supabase.from("trucks").select("*").eq("is_active", true).is("deleted_at", null).order("id", { ascending: true }),
-        supabase.from("delivery_hubs").select("*").eq("is_active", true).is("deleted_at", null).order("name", { ascending: true }),
-        supabase.from("customers").select("*, delivery_hubs(name)").eq("is_active", true).is("deleted_at", null),
-        supabase.from("user_accounts").select("id, full_name, role, username, email, phone_number, assigned_truck_id, photo_url, is_active, created_at").eq("is_active", true).is("deleted_at", null).order("created_at", { ascending: true }),
-        supabase.from("invoices").select("*, load_slips(slip_number, truck_id, truck_plate, driver_name, in_charge_name, status)").is("deleted_at", null).order("created_at", { ascending: false }),
-        supabase.from("load_slips").select("*, load_slip_items(*, delivery_hubs(name)), trucks(plate_number, model)").is("deleted_at", null).order("created_at", { ascending: false })
+        supabase
+          .from("products")
+          .select("id, name, category, description, sack_size, sack_weight_kg, standard_price, image_url, created_at")
+          .eq("is_active", true)
+          .is("deleted_at", null)
+          .order("created_at", { ascending: true }),
+        supabase
+          .from("trucks")
+          .select("id, plate_number, model, sack_capacity, max_sack_capacity, image_url")
+          .eq("is_active", true)
+          .is("deleted_at", null)
+          .order("id", { ascending: true }),
+        supabase
+          .from("delivery_hubs")
+          .select("id, name, address, latitude, longitude, zone, photo_url")
+          .eq("is_active", true)
+          .is("deleted_at", null)
+          .order("name", { ascending: true }),
+        supabase
+          .from("customers")
+          .select("id, name, hub_id, contact_person, contact_phone, default_payment, delivery_hubs(name)")
+          .eq("is_active", true)
+          .is("deleted_at", null),
+        supabase
+          .from("user_accounts")
+          .select("id, full_name, role, username, email, phone_number, assigned_truck_id, photo_url, is_active, created_at")
+          .eq("is_active", true)
+          .is("deleted_at", null)
+          .order("created_at", { ascending: true }),
+        supabase
+          .from("invoices")
+          .select("id, invoice_number, load_slip_id, slip_number, truck_id, truck_plate, driver_id, driver_name, in_charge_name, customer_name, hub_name, product_name, sack_size, planned_qty, delivered_qty, returned_qty, unit_price, total_amount, payment_type, status, issue_date, issued_at, settled_at, settled_by, created_at, load_slips(slip_number, truck_id, truck_plate, driver_name, in_charge_name, status)")
+          .is("deleted_at", null)
+          .order("created_at", { ascending: false }),
+        supabase
+          .from("load_slips")
+          .select("id, slip_number, idempotency_key, date, departure_time, truck_id, truck_plate, in_charge_id, in_charge_name, driver_id, driver_name, status, total_loaded_sacks, total_delivered_sacks, total_returned_sacks, total_cash_revenue, total_charge_revenue, notes, created_by, dispatched_at, delivery_finished_at, remitted_at, remitted_by, created_at, updated_at, trucks(plate_number, model), load_slip_items(id, customer_id, customer_name, hub_id, hub_name, product_id, product_name, sack_size, planned_qty, delivered_qty, returned_qty, unit_price, total_amount, payment_mode, status, partial_reason, delivered_at, delivery_hubs(name))")
+          .is("deleted_at", null)
+          .order("created_at", { ascending: false })
       ]);
 
       let mappedProducts: IceProduct[] = [];
@@ -332,11 +365,11 @@ export class DataService {
         mappedProducts = prodsRes.data.map(p => ({
           id: p.id,
           name: p.name,
-          category: ((p.category || p.description || "Tube") as any),
-          sackSize: p.sack_size || `${p.sack_weight_kg || 50}kg Sack`,
+          category: p.category || p.description || "Ice",
+          sackSize: p.sack_size || `${p.sack_weight_kg || 50}kg`,
           price: roundCurrency(p.standard_price),
           inStock: 0,
-          imageUrl: p.image_url || undefined
+          imageUrl: sanitizeStoredImageUrl(p.image_url)
         }));
         setStorageItem(STORAGE_KEYS.PRODUCTS, mappedProducts);
       }
@@ -352,7 +385,7 @@ export class DataService {
             model: t.model,
             capacitySacks: cap,
             sackCapacity: cap,
-            imageUrl: t.image_url || undefined,
+            imageUrl: sanitizeStoredImageUrl(t.image_url),
             status: "Available"
           };
           trucksMap.set(item.id, item);
@@ -368,17 +401,18 @@ export class DataService {
           address: h.address,
           latitude: Number(h.latitude),
           longitude: Number(h.longitude),
-          zone: (h.zone as any) || "City Proper"
+          zone: (h.zone as any) || "City Proper",
+          imageUrl: sanitizeStoredImageUrl(h.photo_url)
         }));
         setStorageItem(STORAGE_KEYS.LOCATIONS, mappedLocations);
       }
 
       if (!custsRes.error && custsRes.data) {
-        const mappedCustomers: StoreCustomer[] = custsRes.data.map(c => ({
+        const mappedCustomers: StoreCustomer[] = custsRes.data.map((c: any) => ({
           id: c.id,
           name: c.name,
           locationId: c.hub_id,
-          locationName: c.delivery_hubs?.name || "",
+          locationName: (Array.isArray(c.delivery_hubs) ? c.delivery_hubs[0]?.name : c.delivery_hubs?.name) || "",
           contactPerson: c.contact_person || undefined,
           phone: c.contact_phone || undefined,
           defaultIceType: mappedProducts[0]?.name || "",
@@ -563,7 +597,39 @@ export class DataService {
 
   static async addLocation(newLoc: Omit<DeliveryLocation, "id" | "customersCount">): Promise<{ success: boolean; location?: DeliveryLocation; message?: string }> {
     const id = generateUUID();
-    const location: DeliveryLocation = { id, ...newLoc, customersCount: 0 };
+    const safePhoto = sanitizeStoredImageUrl(newLoc.imageUrl) || null;
+    const location: DeliveryLocation = {
+      id,
+      name: newLoc.name,
+      address: newLoc.address,
+      latitude: newLoc.latitude,
+      longitude: newLoc.longitude,
+      zone: newLoc.zone,
+      imageUrl: safePhoto || undefined,
+      customersCount: 0
+    };
+
+    try {
+      const res = await this.authorizedFetch(`${BACKEND_URL}/api/v1/hubs`, {
+        method: "POST",
+        body: JSON.stringify({
+          id,
+          name: newLoc.name,
+          address: newLoc.address,
+          latitude: newLoc.latitude,
+          longitude: newLoc.longitude,
+          zone: newLoc.zone,
+          photo_url: safePhoto
+        })
+      });
+      if (res.ok) {
+        const updated = [location, ...this.getLocations()];
+        setStorageItem(STORAGE_KEYS.LOCATIONS, updated);
+        return { success: true, location };
+      }
+    } catch {
+      // fallback direct Supabase
+    }
 
     const { error } = await supabase.from("delivery_hubs").insert({
       id,
@@ -573,6 +639,7 @@ export class DataService {
       latitude: newLoc.latitude,
       longitude: newLoc.longitude,
       zone: newLoc.zone,
+      photo_url: safePhoto,
       is_active: true
     });
 
@@ -585,9 +652,59 @@ export class DataService {
     return { success: true, location };
   }
 
+  static async updateLocation(id: string, updates: Partial<DeliveryLocation>): Promise<{ success: boolean; location?: DeliveryLocation | null; message?: string }> {
+    const existing = this.getLocations().find(l => l.id === id);
+    const oldPhotoUrl = existing?.imageUrl;
+    const safePhoto = updates.imageUrl !== undefined ? sanitizeStoredImageUrl(updates.imageUrl) || null : undefined;
+
+    const dbPayload: any = {};
+    if (updates.name !== undefined) dbPayload.name = updates.name.trim();
+    if (updates.address !== undefined) dbPayload.address = updates.address.trim();
+    if (updates.latitude !== undefined) dbPayload.latitude = updates.latitude;
+    if (updates.longitude !== undefined) dbPayload.longitude = updates.longitude;
+    if (updates.zone !== undefined) dbPayload.zone = updates.zone;
+    if (safePhoto !== undefined) dbPayload.photo_url = safePhoto;
+
+    try {
+      const res = await this.authorizedFetch(`${BACKEND_URL}/api/v1/hubs/${encodeURIComponent(id)}`, {
+        method: "PUT",
+        body: JSON.stringify(dbPayload)
+      });
+      if (!res.ok) {
+        const { error } = await supabase.from("delivery_hubs").update(dbPayload).eq("id", id);
+        if (error) return { success: false, message: error.message };
+      }
+    } catch {
+      const { error } = await supabase.from("delivery_hubs").update(dbPayload).eq("id", id);
+      if (error) return { success: false, message: error.message };
+    }
+
+    if (safePhoto !== undefined && oldPhotoUrl && oldPhotoUrl !== safePhoto) {
+      await deleteStorageImage(oldPhotoUrl);
+    }
+
+    const list = this.getLocations();
+    const index = list.findIndex(l => l.id === id);
+    if (index >= 0) {
+      list[index] = {
+        ...list[index],
+        ...updates,
+        ...(safePhoto !== undefined ? { imageUrl: safePhoto || undefined } : {})
+      };
+      setStorageItem(STORAGE_KEYS.LOCATIONS, list);
+      return { success: true, location: list[index] };
+    }
+    return { success: true, location: null };
+  }
+
   static async deleteLocation(id: string, deletedBy?: string): Promise<{ success: boolean; message: string }> {
+    const existing = this.getLocations().find(l => l.id === id);
     const res = await this.softDeleteItem("delivery_hubs", id, deletedBy);
     if (res.success) {
+      if (existing?.imageUrl) {
+        await deleteStorageImage(existing.imageUrl);
+        await supabase.from("delivery_hubs").update({ photo_url: null }).eq("id", id);
+      }
       const locations = this.getLocations().filter(l => l.id !== id);
       setStorageItem(STORAGE_KEYS.LOCATIONS, locations);
     }
@@ -604,7 +721,7 @@ export class DataService {
     return this.getCustomers().filter(c => c && c.locationId === locationId);
   }
 
-  // --- ICE PRODUCTS (ALLOW >= 0 PRICE) ---
+  // --- ICE PRODUCTS (ALLOW >= 0 PRICE, SACK SIZE) ---
   static getProducts(): IceProduct[] {
     const prods = getStorageItem<IceProduct[]>(STORAGE_KEYS.PRODUCTS, []);
     return Array.isArray(prods) ? prods : [];
@@ -612,8 +729,19 @@ export class DataService {
 
   static async addProduct(prod: Omit<IceProduct, "id">): Promise<{ success: boolean; product?: IceProduct; message?: string }> {
     const safePrice = roundCurrency(Math.max(0, Number(prod.price) || 0));
+    const safeImageUrl = sanitizeStoredImageUrl(prod.imageUrl) || null;
+    const sackSize = (prod.sackSize || "Medium").trim();
+    const compatCategory = (prod.category || sackSize || "Medium").trim();
     const id = generateUUID();
-    const newProduct: IceProduct = { id, ...prod, price: safePrice };
+    const newProduct: IceProduct = {
+      id,
+      name: prod.name,
+      sackSize,
+      category: compatCategory,
+      price: safePrice,
+      inStock: 0,
+      imageUrl: safeImageUrl || undefined
+    };
 
     try {
       const res = await this.authorizedFetch(`${BACKEND_URL}/api/v1/products`, {
@@ -621,10 +749,10 @@ export class DataService {
         body: JSON.stringify({
           id,
           name: prod.name,
-          category: prod.category,
-          sack_size: prod.sackSize,
+          category: compatCategory,
+          sack_size: sackSize,
           standard_price: safePrice,
-          image_url: prod.imageUrl || null
+          image_url: safeImageUrl
         })
       });
       if (res.ok) {
@@ -640,12 +768,12 @@ export class DataService {
       id,
       code: `PROD-${id.substring(0, 8).toUpperCase()}`,
       name: prod.name,
-      description: prod.category,
-      category: prod.category,
-      sack_size: prod.sackSize,
+      description: sackSize,
+      category: compatCategory,
+      sack_size: sackSize,
       sack_weight_kg: 50.0,
       standard_price: safePrice,
-      image_url: prod.imageUrl || null,
+      image_url: safeImageUrl,
       is_active: true
     });
     if (error) return { success: false, message: error.message };
@@ -676,22 +804,33 @@ export class DataService {
   static async updateProduct(id: string, updates: Partial<IceProduct>): Promise<IceProduct | null> {
     const products = this.getProducts();
     const index = products.findIndex(p => p.id === id);
+    const oldImageUrl = index >= 0 ? products[index].imageUrl : undefined;
     const normalizedPrice = updates.price !== undefined ? roundCurrency(Math.max(0, updates.price)) : undefined;
+    const safeImageUrl =
+      updates.imageUrl !== undefined ? sanitizeStoredImageUrl(updates.imageUrl) || null : undefined;
 
     if (index >= 0) {
-      products[index] = { ...products[index], ...updates, ...(normalizedPrice !== undefined ? { price: normalizedPrice } : {}) };
+      products[index] = {
+        ...products[index],
+        ...updates,
+        ...(normalizedPrice !== undefined ? { price: normalizedPrice } : {}),
+        ...(safeImageUrl !== undefined ? { imageUrl: safeImageUrl || undefined } : {})
+      };
       setStorageItem(STORAGE_KEYS.PRODUCTS, products);
     }
 
     const dbPayload: any = {};
     if (normalizedPrice !== undefined) dbPayload.standard_price = normalizedPrice;
-    if (updates.name !== undefined) dbPayload.name = updates.name;
-    if (updates.category !== undefined) {
+    if (updates.name !== undefined) dbPayload.name = updates.name.trim();
+    if (updates.sackSize !== undefined) {
+      dbPayload.sack_size = updates.sackSize.trim();
+      dbPayload.description = updates.sackSize.trim();
+      dbPayload.category = updates.category || updates.sackSize.trim();
+    } else if (updates.category !== undefined) {
       dbPayload.category = updates.category;
       dbPayload.description = updates.category;
     }
-    if (updates.sackSize !== undefined) dbPayload.sack_size = updates.sackSize;
-    if (updates.imageUrl !== undefined) dbPayload.image_url = updates.imageUrl;
+    if (safeImageUrl !== undefined) dbPayload.image_url = safeImageUrl;
 
     if (Object.keys(dbPayload).length > 0) {
       try {
@@ -707,12 +846,21 @@ export class DataService {
       }
     }
 
+    if (safeImageUrl !== undefined && oldImageUrl && oldImageUrl !== safeImageUrl) {
+      await deleteStorageImage(oldImageUrl);
+    }
+
     return index >= 0 ? products[index] : null;
   }
 
   static async deleteProduct(id: string, deletedBy?: string): Promise<{ success: boolean; message: string }> {
+    const existing = this.getProducts().find(p => p.id === id);
     const res = await this.softDeleteItem("products", id, deletedBy);
     if (res.success) {
+      if (existing?.imageUrl) {
+        await deleteStorageImage(existing.imageUrl);
+        await supabase.from("products").update({ image_url: null }).eq("id", id);
+      }
       const products = this.getProducts().filter(p => p.id !== id);
       setStorageItem(STORAGE_KEYS.PRODUCTS, products);
     }
@@ -780,10 +928,12 @@ export class DataService {
 
   static async addTruck(truckData: Omit<TruckVehicle, "status"> & { status?: TruckVehicle["status"] }): Promise<{ success: boolean; truck?: TruckVehicle; message?: string }> {
     const cap = Math.max(1, Number(truckData.capacitySacks ?? truckData.sackCapacity ?? 120));
+    const safeImageUrl = sanitizeStoredImageUrl(truckData.imageUrl) || null;
     const newTruck: TruckVehicle = {
       ...truckData,
       capacitySacks: cap,
       sackCapacity: cap,
+      imageUrl: safeImageUrl || undefined,
       status: truckData.status || "Available"
     };
 
@@ -795,7 +945,7 @@ export class DataService {
           plate_number: truckData.plateNumber,
           model: truckData.model,
           sack_capacity: cap,
-          image_url: truckData.imageUrl || null
+          image_url: safeImageUrl
         })
       });
       if (res.ok) {
@@ -813,7 +963,7 @@ export class DataService {
       model: truckData.model,
       sack_capacity: cap,
       max_sack_capacity: cap,
-      image_url: truckData.imageUrl || null,
+      image_url: safeImageUrl,
       is_active: true,
       deleted_at: null,
       deleted_by: null
@@ -827,6 +977,11 @@ export class DataService {
 
   static async updateTruck(id: string, updates: Partial<TruckVehicle>): Promise<{ success: boolean; truck?: TruckVehicle | null; message?: string }> {
     const cap = updates.capacitySacks !== undefined ? Math.max(1, Number(updates.capacitySacks)) : updates.sackCapacity;
+    const existingTruck = this.getTrucks().find(t => t.id === id);
+    const oldImageUrl = existingTruck?.imageUrl;
+    const safeImageUrl =
+      updates.imageUrl !== undefined ? sanitizeStoredImageUrl(updates.imageUrl) || null : undefined;
+
     const dbPayload: any = {};
     if (updates.plateNumber) dbPayload.plate_number = updates.plateNumber.trim().toUpperCase();
     if (updates.model) dbPayload.model = updates.model.trim();
@@ -834,7 +989,7 @@ export class DataService {
       dbPayload.sack_capacity = cap;
       dbPayload.max_sack_capacity = cap;
     }
-    if (updates.imageUrl !== undefined) dbPayload.image_url = updates.imageUrl;
+    if (safeImageUrl !== undefined) dbPayload.image_url = safeImageUrl;
 
     try {
       const res = await this.authorizedFetch(`${BACKEND_URL}/api/v1/trucks/${encodeURIComponent(id)}`, {
@@ -843,7 +998,7 @@ export class DataService {
           plate_number: dbPayload.plate_number,
           model: dbPayload.model,
           sack_capacity: cap,
-          image_url: updates.imageUrl
+          ...(safeImageUrl !== undefined ? { image_url: safeImageUrl } : {})
         })
       });
       if (!res.ok) {
@@ -855,13 +1010,18 @@ export class DataService {
       if (error) return { success: false, message: error.message };
     }
 
+    if (safeImageUrl !== undefined && oldImageUrl && oldImageUrl !== safeImageUrl) {
+      await deleteStorageImage(oldImageUrl);
+    }
+
     const trucks = this.getTrucks();
     const index = trucks.findIndex(t => t.id === id);
     if (index >= 0) {
       trucks[index] = {
         ...trucks[index],
         ...updates,
-        ...(cap !== undefined ? { capacitySacks: cap, sackCapacity: cap } : {})
+        ...(cap !== undefined ? { capacitySacks: cap, sackCapacity: cap } : {}),
+        ...(safeImageUrl !== undefined ? { imageUrl: safeImageUrl || undefined } : {})
       };
       setStorageItem(STORAGE_KEYS.TRUCKS, trucks);
       return { success: true, truck: trucks[index] };
@@ -870,8 +1030,13 @@ export class DataService {
   }
 
   static async deleteTruck(id: string, deletedBy?: string): Promise<{ success: boolean; message: string }> {
+    const existing = this.getTrucks().find(t => t.id === id);
     const res = await this.softDeleteItem("trucks", id, deletedBy);
     if (res.success) {
+      if (existing?.imageUrl) {
+        await deleteStorageImage(existing.imageUrl);
+        await supabase.from("trucks").update({ image_url: null }).eq("id", id);
+      }
       const trucks = this.getTrucks().filter(t => t.id !== id);
       setStorageItem(STORAGE_KEYS.TRUCKS, trucks);
     }
@@ -894,6 +1059,7 @@ export class DataService {
 
   static async addUser(newUserData: Omit<UserAccount, "id" | "createdAt">): Promise<{ success: boolean; user?: UserAccount; message?: string }> {
     const id = generateUUID();
+    const safePhoto = sanitizeStoredImageUrl(newUserData.photoUrl) || null;
     try {
       const res = await fetch(`${BACKEND_URL}/api/v1/users`, {
         method: "POST",
@@ -908,7 +1074,7 @@ export class DataService {
           phone_number: newUserData.phone || null,
           email: newUserData.email || null,
           assigned_truck_id: newUserData.assignedTruckId || null,
-          photo_url: newUserData.photoUrl || null
+          photo_url: safePhoto
         })
       });
       const json = await res.json().catch(() => ({}));
@@ -921,7 +1087,7 @@ export class DataService {
           role: json.user.role,
           phone: json.user.phone_number,
           assignedTruckId: json.user.assigned_truck_id,
-          photoUrl: json.user.photo_url,
+          photoUrl: sanitizeStoredImageUrl(json.user.photo_url),
           active: true,
           createdAt: json.user.created_at || new Date().toISOString()
         };
@@ -937,8 +1103,15 @@ export class DataService {
   static async updateUser(id: string, updates: Partial<UserAccount>): Promise<UserAccount | null> {
     const users = this.getUsers();
     const index = users.findIndex(u => u.id === id);
+    const oldPhotoUrl = index >= 0 ? users[index].photoUrl : undefined;
+    const safePhoto = updates.photoUrl !== undefined ? sanitizeStoredImageUrl(updates.photoUrl) || null : undefined;
+
     if (index >= 0) {
-      users[index] = { ...users[index], ...updates };
+      users[index] = {
+        ...users[index],
+        ...updates,
+        ...(safePhoto !== undefined ? { photoUrl: safePhoto || undefined } : {})
+      };
       setStorageItem(STORAGE_KEYS.USERS, users);
     }
 
@@ -955,7 +1128,7 @@ export class DataService {
           phone_number: updates.phone,
           email: updates.email,
           assigned_truck_id: updates.assignedTruckId ?? null,
-          photo_url: updates.photoUrl,
+          ...(safePhoto !== undefined ? { photo_url: safePhoto } : {}),
           is_active: updates.active
         })
       });
@@ -966,19 +1139,28 @@ export class DataService {
       if (updates.username !== undefined) dbPayload.username = updates.username;
       if (updates.phone !== undefined) dbPayload.phone_number = updates.phone;
       if (updates.email !== undefined) dbPayload.email = updates.email;
-      if (updates.photoUrl !== undefined) dbPayload.photo_url = updates.photoUrl;
+      if (safePhoto !== undefined) dbPayload.photo_url = safePhoto;
       if (updates.assignedTruckId !== undefined) dbPayload.assigned_truck_id = updates.assignedTruckId || null;
       if (Object.keys(dbPayload).length > 0) {
         await supabase.from("user_accounts").update(dbPayload).eq("id", id);
       }
     }
 
+    if (safePhoto !== undefined && oldPhotoUrl && oldPhotoUrl !== safePhoto) {
+      await deleteStorageImage(oldPhotoUrl);
+    }
+
     return index >= 0 ? users[index] : null;
   }
 
   static async deleteUser(id: string, deletedBy?: string): Promise<void> {
+    const existing = this.getUsers().find(u => u.id === id);
     const res = await this.softDeleteItem("user_accounts", id, deletedBy);
     if (res.success) {
+      if (existing?.photoUrl) {
+        await deleteStorageImage(existing.photoUrl);
+        await supabase.from("user_accounts").update({ photo_url: null }).eq("id", id);
+      }
       setStorageItem(STORAGE_KEYS.USERS, this.getUsers().filter(u => u.id !== id));
     }
   }

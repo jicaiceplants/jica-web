@@ -28,11 +28,10 @@ const NavItem = ({
   return (
     <button
       onClick={onClick}
-      className={`w-full min-h-[44px] flex items-center justify-between px-4 py-3 rounded-xl transition-all font-bold text-sm cursor-pointer ${
-        active
+      className={`w-full min-h-[44px] flex items-center justify-between px-4 py-3 rounded-xl transition-all font-bold text-sm cursor-pointer ${active
           ? "bg-yellow-400 text-emerald-950 shadow-md hover:brightness-105"
           : "text-emerald-50 hover:bg-white/10 active:bg-white/20"
-      }`}
+        }`}
     >
       <div className="flex items-center gap-3">
         <span className={active ? "opacity-100" : "opacity-80"}>{icon}</span>
@@ -40,9 +39,8 @@ const NavItem = ({
       </div>
       {badge && (
         <span
-          className={`text-[10px] uppercase font-black px-2 py-0.5 rounded-full ${
-            active ? "bg-emerald-950 text-yellow-400" : "bg-white/20 text-white"
-          }`}
+          className={`text-[10px] uppercase font-black px-2 py-0.5 rounded-full ${active ? "bg-emerald-950 text-yellow-400" : "bg-white/20 text-white"
+            }`}
         >
           {badge}
         </span>
@@ -75,9 +73,8 @@ export default function Sidebar({
       )}
 
       <aside
-        className={`fixed inset-y-0 left-0 z-50 w-72 bg-[#00875A] dark:bg-emerald-950 text-white flex flex-col shadow-2xl shrink-0 h-dvh overflow-y-auto scroll-touch border-r border-emerald-800 transform transition-transform duration-200 lg:static lg:translate-x-0 ${
-          isOpen ? "translate-x-0" : "-translate-x-full"
-        }`}
+        className={`fixed inset-y-0 left-0 z-50 w-72 bg-[#00875A] dark:bg-emerald-950 text-white flex flex-col shadow-2xl shrink-0 h-dvh overflow-y-auto scroll-touch border-r border-emerald-800 transform transition-transform duration-200 lg:static lg:translate-x-0 ${isOpen ? "translate-x-0" : "-translate-x-full"
+          }`}
       >
         <div className="p-6 flex flex-col items-center justify-center border-b border-white/10 gap-3 relative">
           {onClose && (
@@ -183,7 +180,7 @@ export default function Sidebar({
             <div className="flex items-center gap-2.5 min-w-0">
               <div className="w-9 h-9 rounded-xl bg-yellow-400 text-emerald-950 font-black flex items-center justify-center shrink-0 overflow-hidden text-sm shadow-inner">
                 {currentUser.photoUrl ? (
-                  <img src={currentUser.photoUrl} alt={currentUser.name} className="w-full h-full object-cover" />
+                  <img src={currentUser.photoUrl} alt={currentUser.name} loading="lazy" className="w-full h-full object-cover" />
                 ) : (
                   <span>{currentUser.name ? currentUser.name.charAt(0) : "U"}</span>
                 )}

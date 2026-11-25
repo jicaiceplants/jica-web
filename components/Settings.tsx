@@ -1,6 +1,6 @@
 "use client";
 
-import React, { useState, useEffect, useCallback } from "react";
+import React, { useState, useEffect, useCallback, useRef } from "react";
 import { DataService } from "@/lib/dataService";
 import { supabase } from "@/lib/supabaseClient";
 import {
@@ -14,7 +14,14 @@ import {
   sanitizePriceTyping,
   normalizePriceOnBlur
 } from "@/lib/currencyUtils";
+import {
+  SACK_SIZE_OPTIONS,
+  SackSizeOption,
+  formatProductLabel,
+  normalizeSackSizeOption
+} from "@/lib/productUtils";
 import { AddLocationModal } from "@/components/AddLocationModal";
+import { ImageUploadField, deleteStorageImage } from "@/components/ImageUploadField";
 import ConfirmModal from "@/components/ConfirmModal";
 import {
   Package,
@@ -47,13 +54,15 @@ export function Settings() {
   const [isRefreshing, setIsRefreshing] = useState(false);
   const [banner, setBanner] = useState<{ type: "success" | "error"; text: string } | null>(null);
 
-  // Add / Edit Product Modal
+  // Add / Edit Product Modal (Restructured: Product Name + Sack Size [Small/Medium/Large] + Price + Photo)
   const [productModalOpen, setProductModalOpen] = useState(false);
   const [editingProduct, setEditingProduct] = useState<IceProduct | null>(null);
   const [prodName, setProdName] = useState("");
-  const [prodCategory, setProdCategory] = useState<IceProduct["category"]>("Tube");
-  const [prodSackSize, setProdSackSize] = useState("50 kg");
+  const [prodSackSize, setProdSackSize] = useState<SackSizeOption>("Medium");
   const [prodPriceStr, setProdPriceStr] = useState("0");
+  const [prodImageUrl, setProdImageUrl] = useState("");
+  const [initialProdImageUrl, setInitialProdImageUrl] = useState("");
+  const prodTempUploadsRef = useRef<string[]>([]);
   const [isSavingProduct, setIsSavingProduct] = useState(false);
 
   // Add / Edit Truck Modal
@@ -63,10 +72,14 @@ export function Settings() {
   const [truckPlate, setTruckPlate] = useState("");
   const [truckModel, setTruckModel] = useState("");
   const [truckCapStr, setTruckCapStr] = useState("120");
+  const [truckImageUrl, setTruckImageUrl] = useState("");
+  const [initialTruckImageUrl, setInitialTruckImageUrl] = useState("");
+  const truckTempUploadsRef = useRef<string[]>([]);
   const [isSavingTruck, setIsSavingTruck] = useState(false);
 
-  // Delivery Hub Modal
-  const [addLocOpen, setAddLocOpen] = useState(false);
+  // Delivery Hub Add / Edit Modal
+  const [hubModalOpen, setHubModalOpen] = useState(false);
+  const [editingHub, setEditingHub] = useState<DeliveryLocation | null>(null);
 
   // Confirm Soft Delete Modal
   const [deleteTarget, setDeleteTarget] = useState<{
@@ -138,33 +151,45 @@ export function Settings() {
     const ok = await DataService.updateProductPrice(prod.id, normalized);
     setSavingPriceId(null);
 
+    const label = formatProductLabel(prod.name, prod.sackSize);
     if (ok) {
       setProducts(prev => prev.map(p => (p.id === prod.id ? { ...p, price: normalized } : p)));
       setBanner({
         type: "success",
-        text: `Updated "${prod.name}" standard price to PHP ${formatPhp(normalized)}.`
+        text: `Updated "${label}" standard price to PHP ${formatPhp(normalized)}.`
       });
     } else {
-      setBanner({ type: "error", text: `Failed to save price for "${prod.name}".` });
+      setBanner({ type: "error", text: `Failed to save price for "${label}".` });
     }
   };
 
   const openAddProductModal = () => {
     setEditingProduct(null);
     setProdName("");
-    setProdCategory("Tube");
-    setProdSackSize("50 kg");
+    setProdSackSize("Medium");
     setProdPriceStr("0");
+    setProdImageUrl("");
+    setInitialProdImageUrl("");
+    prodTempUploadsRef.current = [];
     setProductModalOpen(true);
   };
 
   const openEditProductModal = (prod: IceProduct) => {
     setEditingProduct(prod);
     setProdName(prod.name);
-    setProdCategory(prod.category);
-    setProdSackSize(prod.sackSize);
+    setProdSackSize(normalizeSackSizeOption(prod.sackSize));
     setProdPriceStr(String(prod.price ?? 0));
+    setProdImageUrl(prod.imageUrl || "");
+    setInitialProdImageUrl(prod.imageUrl || "");
+    prodTempUploadsRef.current = [];
     setProductModalOpen(true);
+  };
+
+  const closeProductModal = async () => {
+    const unused = prodTempUploadsRef.current.filter(u => u && u !== initialProdImageUrl);
+    await Promise.all(unused.map(u => deleteStorageImage(u)));
+    prodTempUploadsRef.current = [];
+    setProductModalOpen(false);
   };
 
   const handleSaveProductModal = async (e: React.FormEvent) => {
@@ -178,27 +203,38 @@ export function Settings() {
     setIsSavingProduct(true);
     setBanner(null);
 
+    const unused = prodTempUploadsRef.current.filter(
+      u => u && u !== prodImageUrl && u !== initialProdImageUrl
+    );
+    await Promise.all(unused.map(u => deleteStorageImage(u)));
+    prodTempUploadsRef.current = [];
+
     if (editingProduct) {
       const updated = await DataService.updateProduct(editingProduct.id, {
         name: prodName.trim(),
-        category: prodCategory,
-        sackSize: prodSackSize.trim() || "50 kg",
-        price: finalPrice
+        sackSize: prodSackSize,
+        category: prodSackSize,
+        price: finalPrice,
+        imageUrl: prodImageUrl || ""
       });
       setIsSavingProduct(false);
       if (updated) {
         setProductModalOpen(false);
         await reloadData(false);
-        setBanner({ type: "success", text: `Updated product "${updated.name}".` });
+        setBanner({
+          type: "success",
+          text: `Updated product "${formatProductLabel(updated.name, updated.sackSize)}".`
+        });
       } else {
         setBanner({ type: "error", text: "Failed to update product." });
       }
     } else {
       const res = await DataService.addProduct({
         name: prodName.trim(),
-        category: prodCategory,
-        sackSize: prodSackSize.trim() || "50 kg",
+        sackSize: prodSackSize,
+        category: prodSackSize,
         price: finalPrice,
+        imageUrl: prodImageUrl || undefined,
         inStock: 0
       });
       setIsSavingProduct(false);
@@ -207,7 +243,9 @@ export function Settings() {
         await reloadData(false);
         setBanner({
           type: "success",
-          text: `Added product "${prodName.trim()}" at PHP ${formatPhp(finalPrice)}.`
+          text: `Added "${formatProductLabel(prodName.trim(), prodSackSize)}" at PHP ${formatPhp(
+            finalPrice
+          )}.`
         });
       } else {
         setBanner({ type: "error", text: res.message || "Unable to add product." });
@@ -221,6 +259,9 @@ export function Settings() {
     setTruckPlate("");
     setTruckModel("");
     setTruckCapStr("120");
+    setTruckImageUrl("");
+    setInitialTruckImageUrl("");
+    truckTempUploadsRef.current = [];
     setTruckModalOpen(true);
   };
 
@@ -230,7 +271,17 @@ export function Settings() {
     setTruckPlate(trk.plateNumber);
     setTruckModel(trk.model);
     setTruckCapStr(String(trk.sackCapacity ?? trk.capacitySacks ?? 120));
+    setTruckImageUrl(trk.imageUrl || "");
+    setInitialTruckImageUrl(trk.imageUrl || "");
+    truckTempUploadsRef.current = [];
     setTruckModalOpen(true);
+  };
+
+  const closeTruckModal = async () => {
+    const unused = truckTempUploadsRef.current.filter(u => u && u !== initialTruckImageUrl);
+    await Promise.all(unused.map(u => deleteStorageImage(u)));
+    truckTempUploadsRef.current = [];
+    setTruckModalOpen(false);
   };
 
   const handleSaveTruckModal = async (e: React.FormEvent) => {
@@ -252,12 +303,19 @@ export function Settings() {
     setIsSavingTruck(true);
     setBanner(null);
 
+    const unused = truckTempUploadsRef.current.filter(
+      u => u && u !== truckImageUrl && u !== initialTruckImageUrl
+    );
+    await Promise.all(unused.map(u => deleteStorageImage(u)));
+    truckTempUploadsRef.current = [];
+
     if (editingTruck) {
       const res = await DataService.updateTruck(editingTruck.id, {
         plateNumber: cleanPlate,
         model: cleanModel,
         capacitySacks: parsedCap,
-        sackCapacity: parsedCap
+        sackCapacity: parsedCap,
+        imageUrl: truckImageUrl || ""
       });
       setIsSavingTruck(false);
       if (res.success) {
@@ -276,7 +334,8 @@ export function Settings() {
         plateNumber: cleanPlate,
         model: cleanModel,
         capacitySacks: parsedCap,
-        sackCapacity: parsedCap
+        sackCapacity: parsedCap,
+        imageUrl: truckImageUrl || undefined
       });
       setIsSavingTruck(false);
       if (res.success) {
@@ -292,13 +351,28 @@ export function Settings() {
     }
   };
 
-  const handleSaveLocation = async (loc: Omit<DeliveryLocation, "id" | "customersCount">) => {
-    const res = await DataService.addLocation(loc);
-    if (!res.success) {
-      throw new Error(res.message || "Failed to add delivery hub.");
+  const handleSaveLocation = async (
+    loc: Omit<DeliveryLocation, "id" | "customersCount">,
+    existingId?: string
+  ) => {
+    if (existingId) {
+      const res = await DataService.updateLocation(existingId, {
+        ...loc,
+        imageUrl: loc.imageUrl || ""
+      });
+      if (!res.success) {
+        throw new Error(res.message || "Failed to update delivery hub.");
+      }
+      await reloadData(false);
+      setBanner({ type: "success", text: `Updated Delivery Hub "${loc.name}".` });
+    } else {
+      const res = await DataService.addLocation(loc);
+      if (!res.success) {
+        throw new Error(res.message || "Failed to add delivery hub.");
+      }
+      await reloadData(false);
+      setBanner({ type: "success", text: `Saved Delivery Hub "${loc.name}".` });
     }
-    await reloadData(false);
-    setBanner({ type: "success", text: `Saved Delivery Hub "${loc.name}".` });
   };
 
   const handleConfirmDelete = async () => {
@@ -319,7 +393,7 @@ export function Settings() {
     }
 
     if (res.success) {
-      setBanner({ type: "success", text: `Moved "${label}" to 30-day Trash Archive.` });
+      setBanner({ type: "success", text: `Moved "${label}" to Trash Archive.` });
       await reloadData(false);
     } else {
       setBanner({ type: "error", text: res.message });
@@ -341,7 +415,7 @@ export function Settings() {
             }`}
           >
             <Package className="w-4 h-4" />
-            <span>Products & Pricing ({products.length})</span>
+            <span>Products &amp; Pricing ({products.length})</span>
           </button>
 
           <button
@@ -354,7 +428,7 @@ export function Settings() {
             }`}
           >
             <Truck className="w-4 h-4" />
-            <span>Fleet & Capacities ({trucks.length})</span>
+            <span>Fleet &amp; Capacities ({trucks.length})</span>
           </button>
 
           <button
@@ -405,16 +479,16 @@ export function Settings() {
         </div>
       ) : (
         <>
-          {/* 1. PRODUCTS & PRICING */}
+          {/* 1. PRODUCTS & PRICING (Name + Sack Size [Small / Medium / Large] + Price + Photo) */}
           {activeTab === "products" && (
             <div className="space-y-4">
               <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-3">
                 <div>
                   <h3 className="text-base font-black text-slate-900 dark:text-white">
-                    Ice Products & Wholesale Rates
+                    Ice Products &amp; Wholesale Sack Pricing
                   </h3>
                   <p className="text-xs text-slate-500 dark:text-slate-400">
-                    Adjust prices freely (PHP 0.00+ allowed for promos/complimentary sacks). Changes apply to new Load Slips.
+                    Configure Product Name, Sack Size (Small / Medium / Large), standard unit price (PHP 0.00+ allowed), and photo.
                   </p>
                 </div>
                 <button
@@ -435,82 +509,95 @@ export function Settings() {
                 <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 gap-4">
                   {products.map(prod => {
                     const inputStr = priceStrMap[prod.id] ?? String(prod.price ?? 0);
+                    const formattedTitle = formatProductLabel(prod.name, prod.sackSize);
                     return (
                       <div
                         key={prod.id}
-                        className="bg-white dark:bg-slate-800 rounded-2xl border border-slate-200 dark:border-slate-700 p-5 space-y-4 shadow-xs"
+                        className="bg-white dark:bg-slate-800 rounded-2xl border border-slate-200 dark:border-slate-700 overflow-hidden shadow-xs flex flex-col"
                       >
-                        <div className="flex items-start justify-between gap-2">
-                          <div>
-                            <span className="px-2 py-0.5 rounded-md bg-emerald-50 dark:bg-emerald-950/50 text-[#004D40] dark:text-emerald-300 text-[10px] font-black uppercase">
-                              {prod.category}
-                            </span>
-                            <h4 className="text-base font-black text-slate-900 dark:text-white mt-1">
-                              {prod.name}
-                            </h4>
-                            <p className="text-xs text-slate-500 dark:text-slate-400">
-                              Pack Size: {prod.sackSize}
-                            </p>
-                          </div>
-
-                          <div className="flex items-center gap-1">
-                            <button
-                              type="button"
-                              onClick={() => openEditProductModal(prod)}
-                              aria-label={`Edit ${prod.name}`}
-                              className="min-w-[44px] min-h-[44px] flex items-center justify-center rounded-xl text-slate-600 dark:text-slate-300 hover:bg-slate-100 dark:hover:bg-slate-700 cursor-pointer"
-                              title="Edit Product Details"
-                            >
-                              <Edit3 className="w-4 h-4" />
-                            </button>
-                            <button
-                              type="button"
-                              onClick={() =>
-                                setDeleteTarget({
-                                  kind: "product",
-                                  id: prod.id,
-                                  label: prod.name
-                                })
-                              }
-                              aria-label={`Delete ${prod.name}`}
-                              className="min-w-[44px] min-h-[44px] flex items-center justify-center rounded-xl text-red-600 hover:bg-red-50 dark:hover:bg-red-950/40 cursor-pointer"
-                              title="Move to Trash"
-                            >
-                              <Trash2 className="w-4 h-4" />
-                            </button>
-                          </div>
+                        <div className="h-36 bg-slate-100 dark:bg-slate-900/60 border-b border-slate-200 dark:border-slate-700 flex items-center justify-center overflow-hidden">
+                          {prod.imageUrl ? (
+                            <img
+                              src={prod.imageUrl}
+                              alt={formattedTitle}
+                              loading="lazy"
+                              className="w-full h-full object-cover"
+                            />
+                          ) : (
+                            <Package className="w-10 h-10 text-slate-300 dark:text-slate-600" />
+                          )}
                         </div>
 
-                        <div className="pt-2 border-t border-slate-100 dark:border-slate-700">
-                          <label className="block text-[11px] font-bold uppercase text-slate-500 dark:text-slate-400 mb-1.5">
-                            Standard Price (PHP / unit)
-                          </label>
-                          <div className="flex items-center gap-2">
-                            <div className="relative flex-1">
-                              <span className="absolute left-3 top-1/2 -translate-y-1/2 text-xs font-bold text-slate-400">
-                                PHP
+                        <div className="p-5 space-y-4 flex-1 flex flex-col justify-between">
+                          <div className="flex items-start justify-between gap-2">
+                            <div className="min-w-0">
+                              <span className="px-2 py-0.5 rounded-md bg-emerald-50 dark:bg-emerald-950/50 text-[#004D40] dark:text-emerald-300 text-[10px] font-black uppercase">
+                                {prod.sackSize || "Standard"}
                               </span>
-                              <input
-                                type="text"
-                                inputMode="decimal"
-                                value={inputStr}
-                                onChange={(e) => handleCardPriceChange(prod.id, e.target.value)}
-                                onBlur={() => {
-                                  const norm = normalizePriceOnBlur(inputStr);
-                                  setPriceStrMap(prev => ({ ...prev, [prod.id]: String(norm) }));
-                                }}
-                                className="w-full min-h-[44px] pl-11 pr-3 py-2 bg-slate-50 dark:bg-slate-900/50 border border-slate-300 dark:border-slate-600 rounded-xl text-base sm:text-sm font-black text-slate-900 dark:text-white focus:outline-hidden focus:ring-2 focus:ring-[#004D40]"
-                              />
+                              <h4 className="text-base font-black text-slate-900 dark:text-white mt-1 truncate">
+                                {formattedTitle}
+                              </h4>
                             </div>
-                            <button
-                              type="button"
-                              onClick={() => handleSaveCardPrice(prod)}
-                              disabled={savingPriceId === prod.id}
-                              className="min-w-[44px] min-h-[44px] px-3.5 py-2 bg-[#004D40] hover:bg-emerald-900 text-white text-xs font-bold rounded-xl flex items-center gap-1.5 cursor-pointer disabled:opacity-60"
-                            >
-                              <Save className="w-4 h-4" />
-                              <span>{savingPriceId === prod.id ? "..." : "Save"}</span>
-                            </button>
+
+                            <div className="flex items-center gap-1 shrink-0">
+                              <button
+                                type="button"
+                                onClick={() => openEditProductModal(prod)}
+                                aria-label={`Edit ${formattedTitle}`}
+                                className="min-w-[44px] min-h-[44px] flex items-center justify-center rounded-xl text-slate-600 dark:text-slate-300 hover:bg-slate-100 dark:hover:bg-slate-700 cursor-pointer"
+                                title="Edit Product Details & Photo"
+                              >
+                                <Edit3 className="w-4 h-4" />
+                              </button>
+                              <button
+                                type="button"
+                                onClick={() =>
+                                  setDeleteTarget({
+                                    kind: "product",
+                                    id: prod.id,
+                                    label: formattedTitle
+                                  })
+                                }
+                                aria-label={`Delete ${formattedTitle}`}
+                                className="min-w-[44px] min-h-[44px] flex items-center justify-center rounded-xl text-red-600 hover:bg-red-50 dark:hover:bg-red-950/40 cursor-pointer"
+                                title="Move to Trash"
+                              >
+                                <Trash2 className="w-4 h-4" />
+                              </button>
+                            </div>
+                          </div>
+
+                          <div className="pt-2 border-t border-slate-100 dark:border-slate-700">
+                            <label className="block text-[11px] font-bold uppercase text-slate-500 dark:text-slate-400 mb-1.5">
+                              Standard Price (PHP / sack)
+                            </label>
+                            <div className="flex items-center gap-2">
+                              <div className="relative flex-1">
+                                <span className="absolute left-3 top-1/2 -translate-y-1/2 text-xs font-bold text-slate-400">
+                                  PHP
+                                </span>
+                                <input
+                                  type="text"
+                                  inputMode="decimal"
+                                  value={inputStr}
+                                  onChange={(e) => handleCardPriceChange(prod.id, e.target.value)}
+                                  onBlur={() => {
+                                    const norm = normalizePriceOnBlur(inputStr);
+                                    setPriceStrMap(prev => ({ ...prev, [prod.id]: String(norm) }));
+                                  }}
+                                  className="w-full min-h-[44px] pl-11 pr-3 py-2 bg-slate-50 dark:bg-slate-900/50 border border-slate-300 dark:border-slate-600 rounded-xl text-base sm:text-sm font-black text-slate-900 dark:text-white focus:outline-hidden focus:ring-2 focus:ring-[#004D40]"
+                                />
+                              </div>
+                              <button
+                                type="button"
+                                onClick={() => handleSaveCardPrice(prod)}
+                                disabled={savingPriceId === prod.id}
+                                className="min-w-[44px] min-h-[44px] px-3.5 py-2 bg-[#004D40] hover:bg-emerald-900 text-white text-xs font-bold rounded-xl flex items-center gap-1.5 cursor-pointer disabled:opacity-60"
+                              >
+                                <Save className="w-4 h-4" />
+                                <span>{savingPriceId === prod.id ? "..." : "Save"}</span>
+                              </button>
+                            </div>
                           </div>
                         </div>
                       </div>
@@ -527,10 +614,10 @@ export function Settings() {
               <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-3">
                 <div>
                   <h3 className="text-base font-black text-slate-900 dark:text-white">
-                    Fleet Vehicles & Sack Capacity Limits
+                    Fleet Vehicles &amp; Sack Capacity Limits
                   </h3>
                   <p className="text-xs text-slate-500 dark:text-slate-400">
-                    Dispatchers cannot exceed a truck&apos;s maximum sack capacity across concurrent active load slips.
+                    Manage truck photos, plate numbers, and concurrent active dispatch sack limits.
                   </p>
                 </div>
                 <button
@@ -558,69 +645,84 @@ export function Settings() {
                     return (
                       <div
                         key={trk.id}
-                        className="bg-white dark:bg-slate-800 rounded-2xl border border-slate-200 dark:border-slate-700 p-5 space-y-3 shadow-xs"
+                        className="bg-white dark:bg-slate-800 rounded-2xl border border-slate-200 dark:border-slate-700 overflow-hidden shadow-xs"
                       >
-                        <div className="flex items-start justify-between gap-2">
-                          <div>
-                            <div className="flex items-center gap-2">
-                              <span className="font-mono text-sm font-black text-[#004D40] dark:text-emerald-300">
-                                {trk.id}
-                              </span>
-                              <span className="px-2 py-0.5 rounded-full bg-slate-100 dark:bg-slate-700 text-[11px] font-bold text-slate-700 dark:text-slate-200">
-                                {trk.plateNumber}
-                              </span>
-                            </div>
-                            <h4 className="text-sm font-bold text-slate-900 dark:text-white mt-1">
-                              {trk.model}
-                            </h4>
-                          </div>
-
-                          <div className="flex items-center gap-1">
-                            <button
-                              type="button"
-                              onClick={() => openEditTruckModal(trk)}
-                              aria-label={`Edit ${trk.id}`}
-                              className="min-w-[44px] min-h-[44px] flex items-center justify-center rounded-xl text-slate-600 dark:text-slate-300 hover:bg-slate-100 dark:hover:bg-slate-700 cursor-pointer"
-                              title="Edit Truck & Capacity"
-                            >
-                              <Edit3 className="w-4 h-4" />
-                            </button>
-                            <button
-                              type="button"
-                              onClick={() =>
-                                setDeleteTarget({
-                                  kind: "truck",
-                                  id: trk.id,
-                                  label: `${trk.id} (${trk.plateNumber})`
-                                })
-                              }
-                              aria-label={`Delete ${trk.id}`}
-                              className="min-w-[44px] min-h-[44px] flex items-center justify-center rounded-xl text-red-600 hover:bg-red-50 dark:hover:bg-red-950/40 cursor-pointer"
-                              title="Move to Trash"
-                            >
-                              <Trash2 className="w-4 h-4" />
-                            </button>
-                          </div>
+                        <div className="h-36 bg-slate-100 dark:bg-slate-900/60 border-b border-slate-200 dark:border-slate-700 flex items-center justify-center overflow-hidden">
+                          {trk.imageUrl ? (
+                            <img
+                              src={trk.imageUrl}
+                              alt={`${trk.id} ${trk.plateNumber}`}
+                              loading="lazy"
+                              className="w-full h-full object-cover"
+                            />
+                          ) : (
+                            <Truck className="w-10 h-10 text-slate-300 dark:text-slate-600" />
+                          )}
                         </div>
 
-                        <div className="p-3 rounded-xl bg-slate-50 dark:bg-slate-900/50 border border-slate-200 dark:border-slate-700 text-xs space-y-1">
-                          <div className="flex items-center justify-between">
-                            <span className="text-slate-500">Max Load Capacity</span>
-                            <strong className="text-slate-900 dark:text-white">
-                              {totalCap} sacks
-                            </strong>
+                        <div className="p-5 space-y-3">
+                          <div className="flex items-start justify-between gap-2">
+                            <div>
+                              <div className="flex items-center gap-2">
+                                <span className="font-mono text-sm font-black text-[#004D40] dark:text-emerald-300">
+                                  {trk.id}
+                                </span>
+                                <span className="px-2 py-0.5 rounded-full bg-slate-100 dark:bg-slate-700 text-[11px] font-bold text-slate-700 dark:text-slate-200">
+                                  {trk.plateNumber}
+                                </span>
+                              </div>
+                              <h4 className="text-sm font-bold text-slate-900 dark:text-white mt-1">
+                                {trk.model}
+                              </h4>
+                            </div>
+
+                            <div className="flex items-center gap-1">
+                              <button
+                                type="button"
+                                onClick={() => openEditTruckModal(trk)}
+                                aria-label={`Edit ${trk.id}`}
+                                className="min-w-[44px] min-h-[44px] flex items-center justify-center rounded-xl text-slate-600 dark:text-slate-300 hover:bg-slate-100 dark:hover:bg-slate-700 cursor-pointer"
+                                title="Edit Truck, Capacity & Photo"
+                              >
+                                <Edit3 className="w-4 h-4" />
+                              </button>
+                              <button
+                                type="button"
+                                onClick={() =>
+                                  setDeleteTarget({
+                                    kind: "truck",
+                                    id: trk.id,
+                                    label: `${trk.id} (${trk.plateNumber})`
+                                  })
+                                }
+                                aria-label={`Delete ${trk.id}`}
+                                className="min-w-[44px] min-h-[44px] flex items-center justify-center rounded-xl text-red-600 hover:bg-red-50 dark:hover:bg-red-950/40 cursor-pointer"
+                                title="Move to Trash"
+                              >
+                                <Trash2 className="w-4 h-4" />
+                              </button>
+                            </div>
                           </div>
-                          <div className="flex items-center justify-between">
-                            <span className="text-slate-500">Available Right Now</span>
-                            <strong
-                              className={
-                                remaining === 0
-                                  ? "text-red-600"
-                                  : "text-emerald-700 dark:text-emerald-400"
-                              }
-                            >
-                              {remaining} / {totalCap} ({used} active)
-                            </strong>
+
+                          <div className="p-3 rounded-xl bg-slate-50 dark:bg-slate-900/50 border border-slate-200 dark:border-slate-700 text-xs space-y-1">
+                            <div className="flex items-center justify-between">
+                              <span className="text-slate-500">Max Load Capacity</span>
+                              <strong className="text-slate-900 dark:text-white">
+                                {totalCap} sacks
+                              </strong>
+                            </div>
+                            <div className="flex items-center justify-between">
+                              <span className="text-slate-500">Available Right Now</span>
+                              <strong
+                                className={
+                                  remaining === 0
+                                    ? "text-red-600"
+                                    : "text-emerald-700 dark:text-emerald-400"
+                                }
+                              >
+                                {remaining} / {totalCap} ({used} active)
+                              </strong>
+                            </div>
                           </div>
                         </div>
                       </div>
@@ -631,21 +733,24 @@ export function Settings() {
             </div>
           )}
 
-          {/* 3. DELIVERY HUBS */}
+          {/* 3. DELIVERY HUBS (With Storefront Photos + Edit/Delete) */}
           {activeTab === "hubs" && (
             <div className="space-y-4">
               <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-3">
                 <div>
                   <h3 className="text-base font-black text-slate-900 dark:text-white">
-                    Delivery Hubs & Geolocation Pins
+                    Delivery Hubs &amp; Storefront Pins
                   </h3>
                   <p className="text-xs text-slate-500 dark:text-slate-400">
-                    Manage drop-off hubs across Cagayan de Oro with fast Google Maps coordinate placement.
+                    Manage Cagayan de Oro drop-off hubs, storefront reference photos, and GPS coordinates.
                   </p>
                 </div>
                 <button
                   type="button"
-                  onClick={() => setAddLocOpen(true)}
+                  onClick={() => {
+                    setEditingHub(null);
+                    setHubModalOpen(true);
+                  }}
                   className="min-h-[44px] px-4 py-2.5 bg-[#004D40] hover:bg-emerald-900 text-white font-bold text-xs rounded-xl flex items-center gap-1.5 cursor-pointer self-start"
                 >
                   <Plus className="w-4 h-4" />
@@ -662,36 +767,65 @@ export function Settings() {
                   {locations.map(loc => (
                     <div
                       key={loc.id}
-                      className="bg-white dark:bg-slate-800 rounded-2xl border border-slate-200 dark:border-slate-700 p-5 space-y-2 shadow-xs"
+                      className="bg-white dark:bg-slate-800 rounded-2xl border border-slate-200 dark:border-slate-700 overflow-hidden shadow-xs"
                     >
-                      <div className="flex items-start justify-between gap-2">
-                        <div>
-                          <span className="px-2 py-0.5 rounded-md bg-sky-50 dark:bg-sky-950/40 text-sky-700 dark:text-sky-300 text-[10px] font-black uppercase">
-                            {loc.zone}
-                          </span>
-                          <h4 className="text-base font-black text-slate-900 dark:text-white mt-1">
-                            {loc.name}
-                          </h4>
-                        </div>
-                        <button
-                          type="button"
-                          onClick={() =>
-                            setDeleteTarget({
-                              kind: "location",
-                              id: loc.id,
-                              label: loc.name
-                            })
-                          }
-                          aria-label={`Delete ${loc.name}`}
-                          className="min-w-[44px] min-h-[44px] flex items-center justify-center rounded-xl text-red-600 hover:bg-red-50 dark:hover:bg-red-950/40 cursor-pointer shrink-0"
-                          title="Move to Trash"
-                        >
-                          <Trash2 className="w-4 h-4" />
-                        </button>
+                      <div className="h-36 bg-slate-100 dark:bg-slate-900/60 border-b border-slate-200 dark:border-slate-700 flex items-center justify-center overflow-hidden">
+                        {loc.imageUrl ? (
+                          <img
+                            src={loc.imageUrl}
+                            alt={loc.name}
+                            loading="lazy"
+                            className="w-full h-full object-cover"
+                          />
+                        ) : (
+                          <MapPin className="w-10 h-10 text-slate-300 dark:text-slate-600" />
+                        )}
                       </div>
-                      <p className="text-xs text-slate-500 dark:text-slate-400">{loc.address}</p>
-                      <div className="text-[11px] font-mono text-slate-400 pt-1">
-                        {loc.latitude.toFixed(5)}, {loc.longitude.toFixed(5)}
+
+                      <div className="p-5 space-y-2">
+                        <div className="flex items-start justify-between gap-2">
+                          <div className="min-w-0">
+                            <span className="px-2 py-0.5 rounded-md bg-sky-50 dark:bg-sky-950/40 text-sky-700 dark:text-sky-300 text-[10px] font-black uppercase">
+                              {loc.zone}
+                            </span>
+                            <h4 className="text-base font-black text-slate-900 dark:text-white mt-1 truncate">
+                              {loc.name}
+                            </h4>
+                          </div>
+                          <div className="flex items-center gap-1 shrink-0">
+                            <button
+                              type="button"
+                              onClick={() => {
+                                setEditingHub(loc);
+                                setHubModalOpen(true);
+                              }}
+                              aria-label={`Edit ${loc.name}`}
+                              className="min-w-[44px] min-h-[44px] flex items-center justify-center rounded-xl text-slate-600 dark:text-slate-300 hover:bg-slate-100 dark:hover:bg-slate-700 cursor-pointer"
+                              title="Edit Delivery Hub"
+                            >
+                              <Edit3 className="w-4 h-4" />
+                            </button>
+                            <button
+                              type="button"
+                              onClick={() =>
+                                setDeleteTarget({
+                                  kind: "location",
+                                  id: loc.id,
+                                  label: loc.name
+                                })
+                              }
+                              aria-label={`Delete ${loc.name}`}
+                              className="min-w-[44px] min-h-[44px] flex items-center justify-center rounded-xl text-red-600 hover:bg-red-50 dark:hover:bg-red-950/40 cursor-pointer"
+                              title="Move to Trash"
+                            >
+                              <Trash2 className="w-4 h-4" />
+                            </button>
+                          </div>
+                        </div>
+                        <p className="text-xs text-slate-500 dark:text-slate-400">{loc.address}</p>
+                        <div className="text-[11px] font-mono text-slate-400 pt-1">
+                          {loc.latitude.toFixed(5)}, {loc.longitude.toFixed(5)}
+                        </div>
                       </div>
                     </div>
                   ))}
@@ -702,23 +836,32 @@ export function Settings() {
         </>
       )}
 
-      {/* ADD / EDIT PRODUCT MODAL */}
+      {/* ADD / EDIT PRODUCT MODAL (Product Name + Sack Size [Small/Medium/Large] + Price + Photo) */}
       {productModalOpen && (
         <div className="fixed inset-0 z-50 bg-black/60 backdrop-blur-xs flex items-center justify-center p-4 overflow-y-auto">
           <div className="bg-white dark:bg-slate-900 rounded-2xl max-w-md w-full border border-slate-200 dark:border-slate-700 shadow-2xl overflow-hidden max-h-[90dvh] overflow-y-auto">
             <div className="p-5 bg-[#004D40] text-white flex items-center justify-between">
               <h3 className="text-lg font-black">
-                {editingProduct ? `Edit Product` : `Add New Ice Product`}
+                {editingProduct ? "Edit Ice Product" : "Add New Ice Product"}
               </h3>
               <button
                 type="button"
-                onClick={() => setProductModalOpen(false)}
+                onClick={closeProductModal}
                 className="min-w-[44px] min-h-[44px] flex items-center justify-center rounded-xl hover:bg-white/10 cursor-pointer"
               >
                 <X className="w-5 h-5" />
               </button>
             </div>
             <form onSubmit={handleSaveProductModal} className="p-5 space-y-4">
+              <ImageUploadField
+                label="Product Photo (Optional)"
+                folder="products"
+                value={prodImageUrl}
+                onChange={setProdImageUrl}
+                onTempUploadCreated={(url) => prodTempUploadsRef.current.push(url)}
+                fallbackIcon={<Package className="w-8 h-8" />}
+              />
+
               <div>
                 <label className="block text-xs font-bold uppercase text-slate-600 dark:text-slate-300 mb-1.5">
                   Product Name *
@@ -728,7 +871,7 @@ export function Settings() {
                   required
                   value={prodName}
                   onChange={(e) => setProdName(e.target.value)}
-                  placeholder="Enter product name"
+                  placeholder="e.g. Tube Ice, Crushed Ice, Block Ice"
                   className="w-full min-h-[44px] px-3.5 py-2 bg-slate-50 dark:bg-slate-800 border border-slate-300 dark:border-slate-700 rounded-xl text-base sm:text-sm text-slate-900 dark:text-white"
                 />
               </div>
@@ -736,54 +879,49 @@ export function Settings() {
               <div className="grid grid-cols-2 gap-3">
                 <div>
                   <label className="block text-xs font-bold uppercase text-slate-600 dark:text-slate-300 mb-1.5">
-                    Category
+                    Sack Size *
                   </label>
                   <select
-                    value={prodCategory}
-                    onChange={(e) => setProdCategory(e.target.value as IceProduct["category"])}
+                    value={prodSackSize}
+                    onChange={(e) => setProdSackSize(e.target.value as SackSizeOption)}
                     className="w-full min-h-[44px] px-3 py-2 bg-slate-50 dark:bg-slate-800 border border-slate-300 dark:border-slate-700 rounded-xl text-base sm:text-sm font-bold text-slate-900 dark:text-white"
                   >
-                    <option value="Tube">Tube</option>
-                    <option value="Block">Block</option>
-                    <option value="Crushed">Crushed</option>
+                    {SACK_SIZE_OPTIONS.map(sz => (
+                      <option key={sz} value={sz}>
+                        {sz}
+                      </option>
+                    ))}
                   </select>
                 </div>
+
                 <div>
                   <label className="block text-xs font-bold uppercase text-slate-600 dark:text-slate-300 mb-1.5">
-                    Sack / Unit Size
+                    Price (PHP, &gt;= 0)
                   </label>
                   <input
                     type="text"
-                    value={prodSackSize}
-                    onChange={(e) => setProdSackSize(e.target.value)}
-                    placeholder="50 kg"
-                    className="w-full min-h-[44px] px-3.5 py-2 bg-slate-50 dark:bg-slate-800 border border-slate-300 dark:border-slate-700 rounded-xl text-base sm:text-sm text-slate-900 dark:text-white"
+                    inputMode="decimal"
+                    value={prodPriceStr}
+                    onChange={(e) => {
+                      const clean = sanitizePriceTyping(e.target.value);
+                      if (clean !== null) setProdPriceStr(clean);
+                    }}
+                    onBlur={() => setProdPriceStr(String(normalizePriceOnBlur(prodPriceStr)))}
+                    placeholder="0.00"
+                    className="w-full min-h-[44px] px-3.5 py-2 bg-slate-50 dark:bg-slate-800 border border-slate-300 dark:border-slate-700 rounded-xl text-base sm:text-sm font-black text-slate-900 dark:text-white"
                   />
                 </div>
               </div>
 
-              <div>
-                <label className="block text-xs font-bold uppercase text-slate-600 dark:text-slate-300 mb-1.5">
-                  Standard Price (PHP, &gt;= 0)
-                </label>
-                <input
-                  type="text"
-                  inputMode="decimal"
-                  value={prodPriceStr}
-                  onChange={(e) => {
-                    const clean = sanitizePriceTyping(e.target.value);
-                    if (clean !== null) setProdPriceStr(clean);
-                  }}
-                  onBlur={() => setProdPriceStr(String(normalizePriceOnBlur(prodPriceStr)))}
-                  placeholder="0.00"
-                  className="w-full min-h-[44px] px-3.5 py-2 bg-slate-50 dark:bg-slate-800 border border-slate-300 dark:border-slate-700 rounded-xl text-base sm:text-sm font-black text-slate-900 dark:text-white"
-                />
+              <div className="p-3 rounded-xl bg-emerald-50 dark:bg-emerald-950/40 border border-emerald-200 dark:border-emerald-800 text-xs text-emerald-900 dark:text-emerald-200">
+                Displays as:{" "}
+                <strong>{formatProductLabel(prodName || "Ice Product", prodSackSize)}</strong>
               </div>
 
               <div className="flex justify-end gap-2.5 pt-2">
                 <button
                   type="button"
-                  onClick={() => setProductModalOpen(false)}
+                  onClick={closeProductModal}
                   className="min-h-[44px] px-4 py-2 bg-slate-100 hover:bg-slate-200 dark:bg-slate-800 text-slate-700 dark:text-slate-200 font-bold text-sm rounded-xl cursor-pointer"
                 >
                   Cancel
@@ -811,13 +949,22 @@ export function Settings() {
               </h3>
               <button
                 type="button"
-                onClick={() => setTruckModalOpen(false)}
+                onClick={closeTruckModal}
                 className="min-w-[44px] min-h-[44px] flex items-center justify-center rounded-xl hover:bg-white/10 cursor-pointer"
               >
                 <X className="w-5 h-5" />
               </button>
             </div>
             <form onSubmit={handleSaveTruckModal} className="p-5 space-y-4">
+              <ImageUploadField
+                label="Vehicle Photo (Optional)"
+                folder="trucks"
+                value={truckImageUrl}
+                onChange={setTruckImageUrl}
+                onTempUploadCreated={(url) => truckTempUploadsRef.current.push(url)}
+                fallbackIcon={<Truck className="w-8 h-8" />}
+              />
+
               <div>
                 <label className="block text-xs font-bold uppercase text-slate-600 dark:text-slate-300 mb-1.5">
                   Truck Code *
@@ -881,7 +1028,7 @@ export function Settings() {
               <div className="flex justify-end gap-2.5 pt-2">
                 <button
                   type="button"
-                  onClick={() => setTruckModalOpen(false)}
+                  onClick={closeTruckModal}
                   className="min-h-[44px] px-4 py-2 bg-slate-100 hover:bg-slate-200 dark:bg-slate-800 text-slate-700 dark:text-slate-200 font-bold text-sm rounded-xl cursor-pointer"
                 >
                   Cancel
@@ -900,8 +1047,12 @@ export function Settings() {
       )}
 
       <AddLocationModal
-        isOpen={addLocOpen}
-        onClose={() => setAddLocOpen(false)}
+        isOpen={hubModalOpen}
+        initialLocation={editingHub}
+        onClose={() => {
+          setHubModalOpen(false);
+          setEditingHub(null);
+        }}
         onSave={handleSaveLocation}
       />
 

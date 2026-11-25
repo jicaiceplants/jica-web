@@ -130,8 +130,19 @@ export function AccountManagement() {
       <div className="grid grid-cols-1 lg:grid-cols-2 gap-6">
         {/* Update My Own Password */}
         <div className="bg-white dark:bg-slate-800 rounded-2xl border border-slate-200 dark:border-slate-700 p-6 space-y-4 shadow-xs">
-          <div className="flex items-center gap-2.5 border-b border-slate-100 dark:border-slate-700 pb-3">
-            <KeyRound className="w-5 h-5 text-[#004D40] dark:text-emerald-400" />
+          <div className="flex items-center gap-3 border-b border-slate-100 dark:border-slate-700 pb-3">
+            <div className="w-11 h-11 rounded-full bg-emerald-100 dark:bg-emerald-950/60 text-[#004D40] dark:text-emerald-300 font-black flex items-center justify-center overflow-hidden shrink-0">
+              {currentUser?.photoUrl ? (
+                <img
+                  src={currentUser.photoUrl}
+                  alt={currentUser.name}
+                  loading="lazy"
+                  className="w-full h-full object-cover"
+                />
+              ) : (
+                <KeyRound className="w-5 h-5" />
+              )}
+            </div>
             <div>
               <h3 className="text-base font-black text-slate-900 dark:text-white">
                 Change My Password

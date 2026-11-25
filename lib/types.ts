@@ -20,8 +20,8 @@ export interface UserAccount {
 export interface IceProduct {
   id: string;
   name: string;
-  category: "Tube" | "Block" | "Crushed";
-  sackSize: string;
+  sackSize: string; // "Small" | "Medium" | "Large" (or legacy sack label)
+  category?: string; // Kept optional for legacy DB row compatibility
   price: number; // in PHP (>= 0 allowed)
   inStock: number;
   imageUrl?: string;
@@ -34,6 +34,7 @@ export interface DeliveryLocation {
   latitude: number;
   longitude: number;
   zone: "City Proper" | "Lapasan/Gusa Corridor" | "Uptown CDO" | "Market District";
+  imageUrl?: string;
   customersCount?: number;
 }
 

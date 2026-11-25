@@ -6,6 +6,7 @@ import { supabase } from "@/lib/supabaseClient";
 import { InvoiceRecord } from "@/lib/types";
 import { formatPhp } from "@/lib/currencyUtils";
 import { formatManilaDateTime, getCurrentManilaYear, getManilaDateString } from "@/lib/dateUtils";
+import { formatProductLabel } from "@/lib/productUtils";
 import ConfirmModal from "@/components/ConfirmModal";
 import {
   FileText,
@@ -295,11 +296,10 @@ export function Invoices() {
 
       {feedback && (
         <div
-          className={`p-4 rounded-2xl border text-xs font-bold flex items-center gap-2 ${
-            feedback.type === "success"
-              ? "bg-emerald-50 dark:bg-emerald-950/40 border-emerald-200 dark:border-emerald-800 text-emerald-800 dark:text-emerald-200"
-              : "bg-red-50 dark:bg-red-950/40 border-red-200 dark:border-red-800 text-red-700 dark:text-red-300"
-          }`}
+          className={`p-4 rounded-2xl border text-xs font-bold flex items-center gap-2 ${feedback.type === "success"
+            ? "bg-emerald-50 dark:bg-emerald-950/40 border-emerald-200 dark:border-emerald-800 text-emerald-800 dark:text-emerald-200"
+            : "bg-red-50 dark:bg-red-950/40 border-red-200 dark:border-red-800 text-red-700 dark:text-red-300"
+            }`}
         >
           <CheckCircle2 className="w-4 h-4 shrink-0" />
           <span>{feedback.text}</span>
@@ -384,11 +384,10 @@ export function Invoices() {
                 key={tab}
                 type="button"
                 onClick={() => setStatusFilter(tab)}
-                className={`min-h-[44px] px-3.5 py-2 rounded-xl text-xs font-bold transition-all cursor-pointer ${
-                  statusFilter === tab
-                    ? "bg-[#004D40] text-white shadow-sm"
-                    : "bg-slate-100 dark:bg-slate-700 text-slate-600 dark:text-slate-300 hover:bg-slate-200 dark:hover:bg-slate-600"
-                }`}
+                className={`min-h-[44px] px-3.5 py-2 rounded-xl text-xs font-bold transition-all cursor-pointer ${statusFilter === tab
+                  ? "bg-[#004D40] text-white shadow-sm"
+                  : "bg-slate-100 dark:bg-slate-700 text-slate-600 dark:text-slate-300 hover:bg-slate-200 dark:hover:bg-slate-600"
+                  }`}
               >
                 {tab === "ALL" ? "All Receipts" : tab}
               </button>
@@ -450,7 +449,7 @@ export function Invoices() {
                     </td>
                     <td className="px-4 py-3">
                       <div className="font-medium text-slate-800 dark:text-slate-200">
-                        {inv.iceType} ({inv.sackSize})
+                        {formatProductLabel(inv.iceType, inv.sackSize)}
                       </div>
                       <div className="text-[11px] text-slate-400">
                         Del: <strong>{inv.deliveredQty}</strong> / Plan:{" "}
@@ -589,9 +588,8 @@ export function Invoices() {
                     <tr className="border-t border-slate-200 dark:border-slate-700">
                       <td className="px-3 py-3">
                         <div className="font-bold text-slate-900 dark:text-white">
-                          {selectedReceipt.iceType}
+                          {formatProductLabel(selectedReceipt.iceType, selectedReceipt.sackSize)}
                         </div>
-                        <div className="text-[11px] text-slate-400">{selectedReceipt.sackSize}</div>
                       </td>
                       <td className="px-3 py-3 text-center font-mono">
                         {selectedReceipt.plannedQty ?? selectedReceipt.deliveredQty} /{" "}
@@ -600,7 +598,7 @@ export function Invoices() {
                           Math.max(
                             0,
                             (selectedReceipt.plannedQty ?? selectedReceipt.deliveredQty) -
-                              selectedReceipt.deliveredQty
+                            selectedReceipt.deliveredQty
                           )}
                       </td>
                       <td className="px-3 py-3 text-right font-mono">
@@ -677,8 +675,8 @@ export function Invoices() {
         message={
           confirmState.action === "settle"
             ? `Mark ${confirmState.invoice?.invoiceNumber} (PHP ${formatPhp(
-                confirmState.invoice?.totalAmount || 0
-              )}) for ${confirmState.invoice?.customerName} as PAID / SETTLED?`
+              confirmState.invoice?.totalAmount || 0
+            )}) for ${confirmState.invoice?.customerName} as PAID / SETTLED?`
             : `Move ${confirmState.invoice?.invoiceNumber} to the 30-day Trash Archive?`
         }
         onConfirm={handleConfirmAction}

@@ -5,6 +5,7 @@ import { Plus, Trash2, Save, Sparkles, RotateCcw, Check, AlertCircle, RefreshCw,
 import { DeliveryLocation, IceProduct, StoreCustomer, LoadSlipItem, LoadSlip, UserAccount, TruckCapacityInfo } from "@/lib/types";
 import { DataService, generateUUID } from "@/lib/dataService";
 import { multiplyCurrency, roundCurrency, sumCurrency, sanitizePriceTyping, normalizePriceOnBlur, formatPhp } from "@/lib/currencyUtils";
+import { formatProductLabel } from "@/lib/productUtils";
 import { supabase } from "@/lib/supabaseClient";
 import ConfirmModal from "../ConfirmModal";
 
@@ -596,7 +597,7 @@ export default function OrderTable({
                         >
                           {products.map(prod => (
                             <option key={prod.id} value={prod.id}>
-                              {prod.name} (₱{formatPhp(prod.price)})
+                              {formatProductLabel(prod.name, prod.sackSize)} — ₱{formatPhp(prod.price)}
                             </option>
                           ))}
                         </select>

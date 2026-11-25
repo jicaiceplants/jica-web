@@ -6,6 +6,7 @@ import { supabase } from "@/lib/supabaseClient";
 import { LoadSlip } from "@/lib/types";
 import { formatPhp } from "@/lib/currencyUtils";
 import { formatManilaDateTime, getCurrentManilaYear, getManilaDateString } from "@/lib/dateUtils";
+import { formatProductLabel } from "@/lib/productUtils";
 import ConfirmModal from "@/components/ConfirmModal";
 import {
   Search,
@@ -516,8 +517,8 @@ export function LoadSlipHistory() {
                             </div>
                             <div className="text-[11px] text-slate-400">{it.locationName}</div>
                           </td>
-                          <td className="px-3 py-2.5">
-                            {it.iceType} ({it.sackSize})
+                          <td className="px-3 py-2.5 font-semibold">
+                            {formatProductLabel(it.iceType, it.sackSize)}
                           </td>
                           <td className="px-3 py-2.5 text-center font-mono">
                             {it.plannedQty} / {it.deliveredQty} /{" "}

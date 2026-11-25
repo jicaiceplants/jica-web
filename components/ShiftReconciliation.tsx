@@ -5,6 +5,7 @@ import { DataService } from "@/lib/dataService";
 import { supabase } from "@/lib/supabaseClient";
 import { formatPhp, sumCurrency } from "@/lib/currencyUtils";
 import { formatManilaDateTime } from "@/lib/dateUtils";
+import { formatProductLabel } from "@/lib/productUtils";
 import { LoadSlip } from "@/lib/types";
 import {
   ClipboardCheck,
@@ -154,11 +155,10 @@ export function ShiftReconciliation() {
 
       {feedbackBanner && (
         <div
-          className={`p-4 rounded-2xl border flex items-start gap-3 text-xs font-bold ${
-            feedbackBanner.type === "success"
+          className={`p-4 rounded-2xl border flex items-start gap-3 text-xs font-bold ${feedbackBanner.type === "success"
               ? "bg-emerald-50 dark:bg-emerald-950/40 border-emerald-200 dark:border-emerald-800 text-emerald-800 dark:text-emerald-200"
               : "bg-red-50 dark:bg-red-950/40 border-red-200 dark:border-red-800 text-red-700 dark:text-red-300"
-          }`}
+            }`}
         >
           {feedbackBanner.type === "success" ? (
             <CheckCircle2 className="w-5 h-5 shrink-0 mt-0.5 text-emerald-600" />
@@ -197,22 +197,20 @@ export function ShiftReconciliation() {
                   key={slip.id}
                   type="button"
                   onClick={() => setSelectedSlipId(slip.id)}
-                  className={`w-full min-h-[76px] text-left p-4 rounded-2xl border transition-all cursor-pointer ${
-                    active
+                  className={`w-full min-h-[76px] text-left p-4 rounded-2xl border transition-all cursor-pointer ${active
                       ? "bg-[#004D40] text-white border-[#004D40] shadow-md"
                       : "bg-white dark:bg-slate-800 border-slate-200 dark:border-slate-700 hover:border-[#004D40]/50 text-slate-900 dark:text-white"
-                  }`}
+                    }`}
                 >
                   <div className="flex items-center justify-between gap-2">
                     <span className="font-mono text-xs font-black">
                       {slip.slipNumber || slip.id}
                     </span>
                     <span
-                      className={`px-2 py-0.5 rounded-full text-[10px] font-black uppercase ${
-                        active
+                      className={`px-2 py-0.5 rounded-full text-[10px] font-black uppercase ${active
                           ? "bg-emerald-400/20 text-emerald-100"
                           : "bg-amber-100 text-amber-800 dark:bg-amber-900/40 dark:text-amber-300"
-                      }`}
+                        }`}
                     >
                       Awaiting Remit
                     </span>
@@ -221,9 +219,8 @@ export function ShiftReconciliation() {
                     {slip.driverName || "Assigned Driver Pending"}
                   </div>
                   <div
-                    className={`text-xs mt-1 flex items-center justify-between ${
-                      active ? "text-emerald-100" : "text-slate-500 dark:text-slate-400"
-                    }`}
+                    className={`text-xs mt-1 flex items-center justify-between ${active ? "text-emerald-100" : "text-slate-500 dark:text-slate-400"
+                      }`}
                   >
                     <span>
                       {slip.truckId} {slip.truckPlate ? `(${slip.truckPlate})` : ""}
@@ -382,9 +379,8 @@ export function ShiftReconciliation() {
                             </td>
                             <td className="px-4 py-2.5">
                               <span className="font-medium text-slate-700 dark:text-slate-200">
-                                {item.iceType}
+                                {formatProductLabel(item.iceType, item.sackSize)}
                               </span>
-                              <span className="block text-[11px] text-slate-400">{item.sackSize}</span>
                             </td>
                             <td className="px-4 py-2.5 text-center font-mono">
                               {item.plannedQty} /{" "}
@@ -398,11 +394,10 @@ export function ShiftReconciliation() {
                             </td>
                             <td className="px-4 py-2.5">
                               <span
-                                className={`px-2 py-0.5 rounded-full text-[10px] font-bold ${
-                                  item.paymentType === "Cash"
+                                className={`px-2 py-0.5 rounded-full text-[10px] font-bold ${item.paymentType === "Cash"
                                     ? "bg-emerald-100 text-emerald-700 dark:bg-emerald-900/40 dark:text-emerald-300"
                                     : "bg-blue-100 text-blue-700 dark:bg-blue-900/40 dark:text-blue-300"
-                                }`}
+                                  }`}
                               >
                                 {item.paymentType}
                               </span>

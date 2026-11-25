@@ -1,8 +1,9 @@
 "use client";
 
-import React, { useState, useEffect, useCallback, useMemo } from "react";
+import React, { useState, useEffect, useCallback, useMemo, useRef } from "react";
 import { DataService } from "@/lib/dataService";
 import { UserAccount, Role, TruckVehicle } from "@/lib/types";
+import { ImageUploadField, deleteStorageImage } from "@/components/ImageUploadField";
 import ConfirmModal from "@/components/ConfirmModal";
 import {
   Users,
@@ -16,7 +17,8 @@ import {
   RefreshCw,
   Truck,
   Phone,
-  Mail
+  Mail,
+  User as UserIcon
 } from "lucide-react";
 
 const ROLES: Role[] = ["Owner", "Staff", "Driver", "Security"];
@@ -39,6 +41,9 @@ export function EmployeeManagement() {
   const [role, setRole] = useState<Role>("Staff");
   const [password, setPassword] = useState("");
   const [assignedTruckId, setAssignedTruckId] = useState("");
+  const [photoUrl, setPhotoUrl] = useState("");
+  const [initialPhotoUrl, setInitialPhotoUrl] = useState("");
+  const tempUploadsRef = useRef<string[]>([]);
   const [isSaving, setIsSaving] = useState(false);
 
   const [deleteTarget, setDeleteTarget] = useState<UserAccount | null>(null);
@@ -85,6 +90,9 @@ export function EmployeeManagement() {
     setRole("Staff");
     setPassword("");
     setAssignedTruckId("");
+    setPhotoUrl("");
+    setInitialPhotoUrl("");
+    tempUploadsRef.current = [];
     setModalOpen(true);
   };
 
@@ -97,7 +105,18 @@ export function EmployeeManagement() {
     setRole(u.role);
     setPassword("");
     setAssignedTruckId(u.assignedTruckId || "");
+    setPhotoUrl(u.photoUrl || "");
+    setInitialPhotoUrl(u.photoUrl || "");
+    tempUploadsRef.current = [];
     setModalOpen(true);
+  };
+
+  const handleCloseModal = async () => {
+    // Prune any temporary images uploaded during this canceled edit session
+    const unsavedTemps = tempUploadsRef.current.filter(url => url && url !== initialPhotoUrl);
+    await Promise.all(unsavedTemps.map(url => deleteStorageImage(url)));
+    tempUploadsRef.current = [];
+    setModalOpen(false);
   };
 
   const handleSave = async (e: React.FormEvent) => {
@@ -110,6 +129,11 @@ export function EmployeeManagement() {
     setIsSaving(true);
     setBanner(null);
 
+    // Clean up any intermediate uploaded candidates that aren't the final chosen photoUrl
+    const unusedTemps = tempUploadsRef.current.filter(url => url && url !== photoUrl && url !== initialPhotoUrl);
+    await Promise.all(unusedTemps.map(url => deleteStorageImage(url)));
+    tempUploadsRef.current = [];
+
     if (editingUser) {
       const updated = await DataService.updateUser(editingUser.id, {
         name: name.trim(),
@@ -118,10 +142,14 @@ export function EmployeeManagement() {
         phone: phone.trim() || undefined,
         role,
         assignedTruckId: role === "Driver" ? assignedTruckId || undefined : undefined,
+        photoUrl: photoUrl || "",
         ...(password.trim().length >= 4 ? { password: password.trim() } : {})
       });
       setIsSaving(false);
       if (updated) {
+        if (initialPhotoUrl && initialPhotoUrl !== photoUrl) {
+          await deleteStorageImage(initialPhotoUrl);
+        }
         setModalOpen(false);
         await loadRoster(false);
         setBanner({ type: "success", text: `Updated employee record for ${updated.name}.` });
@@ -136,6 +164,7 @@ export function EmployeeManagement() {
         phone: phone.trim() || undefined,
         role,
         assignedTruckId: role === "Driver" ? assignedTruckId || undefined : undefined,
+        photoUrl: photoUrl || undefined,
         password: password.trim() || "1234",
         active: true
       });
@@ -243,8 +272,17 @@ export function EmployeeManagement() {
             >
               <div className="flex items-start justify-between gap-2">
                 <div className="flex items-center gap-3 min-w-0">
-                  <div className="w-11 h-11 rounded-full bg-emerald-100 dark:bg-emerald-950/60 text-[#004D40] dark:text-emerald-300 font-black flex items-center justify-center shrink-0">
-                    {u.name.charAt(0).toUpperCase()}
+                  <div className="w-12 h-12 rounded-full bg-emerald-100 dark:bg-emerald-950/60 text-[#004D40] dark:text-emerald-300 font-black flex items-center justify-center shrink-0 overflow-hidden border border-slate-200 dark:border-slate-700">
+                    {u.photoUrl ? (
+                      <img
+                        src={u.photoUrl}
+                        alt={u.name}
+                        loading="lazy"
+                        className="w-full h-full object-cover"
+                      />
+                    ) : (
+                      <span>{u.name.charAt(0).toUpperCase()}</span>
+                    )}
                   </div>
                   <div className="min-w-0">
                     <h4 className="font-black text-sm text-slate-900 dark:text-white truncate">
@@ -314,13 +352,23 @@ export function EmployeeManagement() {
               </h3>
               <button
                 type="button"
-                onClick={() => setModalOpen(false)}
+                onClick={handleCloseModal}
                 className="min-w-[44px] min-h-[44px] flex items-center justify-center rounded-xl hover:bg-white/10 cursor-pointer"
               >
                 <X className="w-5 h-5" />
               </button>
             </div>
             <form onSubmit={handleSave} className="p-5 space-y-4">
+              <ImageUploadField
+                label="Staff / Driver Photo"
+                folder="employees"
+                shape="circle"
+                value={photoUrl}
+                onChange={setPhotoUrl}
+                onTempUploadCreated={(url) => tempUploadsRef.current.push(url)}
+                fallbackIcon={<UserIcon className="w-8 h-8" />}
+              />
+
               <div>
                 <label className="block text-xs font-bold uppercase text-slate-600 dark:text-slate-300 mb-1">
                   Full Name *
@@ -425,7 +473,7 @@ export function EmployeeManagement() {
               <div className="flex justify-end gap-2.5 pt-2">
                 <button
                   type="button"
-                  onClick={() => setModalOpen(false)}
+                  onClick={handleCloseModal}
                   className="min-h-[44px] px-4 py-2 bg-slate-100 hover:bg-slate-200 dark:bg-slate-800 text-slate-700 dark:text-slate-200 font-bold text-sm rounded-xl cursor-pointer"
                 >
                   Cancel

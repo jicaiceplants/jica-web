@@ -13,6 +13,51 @@ interface GoogleMapPickerProps {
 }
 
 const GOOGLE_MAPS_API_KEY = process.env.NEXT_PUBLIC_GOOGLE_MAPS_API_KEY || "";
+const GEOCODE_CACHE_STORAGE_KEY = "jica_geocode_cache_v1";
+const MAX_CACHE_ENTRIES = 200;
+
+const memGeocodeCache = new Map<string, string>();
+
+function makeCoordCacheKey(lat: number, lng: number): string {
+  // 4 decimal places (~11m grid) prevents duplicate Geocoding billing on nearby drags
+  return `${lat.toFixed(4)},${lng.toFixed(4)}`;
+}
+
+function getCachedGeocode(lat: number, lng: number): string | null {
+  const key = makeCoordCacheKey(lat, lng);
+  if (memGeocodeCache.has(key)) return memGeocodeCache.get(key) || null;
+  if (typeof window === "undefined") return null;
+  try {
+    const raw = localStorage.getItem(GEOCODE_CACHE_STORAGE_KEY);
+    if (!raw) return null;
+    const obj = JSON.parse(raw) as Record<string, string>;
+    if (obj[key]) {
+      memGeocodeCache.set(key, obj[key]);
+      return obj[key];
+    }
+  } catch {
+    // ignore storage read error
+  }
+  return null;
+}
+
+function saveCachedGeocode(lat: number, lng: number, address: string): void {
+  const key = makeCoordCacheKey(lat, lng);
+  memGeocodeCache.set(key, address);
+  if (typeof window === "undefined") return;
+  try {
+    const raw = localStorage.getItem(GEOCODE_CACHE_STORAGE_KEY);
+    const obj = raw ? (JSON.parse(raw) as Record<string, string>) : {};
+    const keys = Object.keys(obj);
+    if (keys.length >= MAX_CACHE_ENTRIES) {
+      delete obj[keys[0]];
+    }
+    obj[key] = address;
+    localStorage.setItem(GEOCODE_CACHE_STORAGE_KEY, JSON.stringify(obj));
+  } catch {
+    // ignore quota error
+  }
+}
 
 export function GoogleMapPicker({
   lat,
@@ -28,6 +73,7 @@ export function GoogleMapPicker({
   const isProgrammaticMoveRef = useRef(false);
   const isMapDraggedRef = useRef(false);
   const lastEmittedRef = useRef<{ lat: number; lng: number }>({ lat, lng });
+  const geocodeDebounceRef = useRef<ReturnType<typeof setTimeout> | null>(null);
 
   const [isLoaded, setIsLoaded] = useState(false);
   const [mapError, setMapError] = useState<string | null>(null);
@@ -46,7 +92,6 @@ export function GoogleMapPicker({
       },
       zoom
     }),
-    // Only capture initial camera options; external movements use panTo cleanly without recreating map
     // eslint-disable-next-line react-hooks/exhaustive-deps
     []
   );
@@ -55,20 +100,34 @@ export function GoogleMapPicker({
     lastEmittedRef.current = { lat: newLat, lng: newLng };
     setDisplayCoord({ lat: newLat, lng: newLng });
 
-    if (geocoderRef.current) {
-      geocoderRef.current.geocode(
+    // Notify coordinates immediately; debounce paid reverse-geocode calls (600ms) + check cache first
+    onPinChangeRef.current(newLat, newLng);
+
+    if (geocodeDebounceRef.current) {
+      clearTimeout(geocodeDebounceRef.current);
+      geocodeDebounceRef.current = null;
+    }
+
+    const cached = getCachedGeocode(newLat, newLng);
+    if (cached) {
+      onPinChangeRef.current(newLat, newLng, cached);
+      return;
+    }
+
+    if (!geocoderRef.current) return;
+
+    geocodeDebounceRef.current = setTimeout(() => {
+      geocoderRef.current?.geocode(
         { location: { lat: newLat, lng: newLng } },
         (results: any, status: string) => {
           if (status === "OK" && results && results[0]?.formatted_address) {
-            onPinChangeRef.current(newLat, newLng, results[0].formatted_address);
-          } else {
-            onPinChangeRef.current(newLat, newLng);
+            const formatted = results[0].formatted_address;
+            saveCachedGeocode(newLat, newLng, formatted);
+            onPinChangeRef.current(newLat, newLng, formatted);
           }
         }
       );
-    } else {
-      onPinChangeRef.current(newLat, newLng);
-    }
+    }, 600);
   };
 
   useEffect(() => {
@@ -90,12 +149,23 @@ export function GoogleMapPicker({
         });
         markerRef.current = marker;
 
-        // Track user map dragging cleanly without reacting during intermediate frames
+        // Cancel pending geocode immediately when starting a new drag
         map.addListener("dragstart", () => {
           isMapDraggedRef.current = true;
+          if (geocodeDebounceRef.current) {
+            clearTimeout(geocodeDebounceRef.current);
+            geocodeDebounceRef.current = null;
+          }
         });
 
-        // Fire coordinate + reverse geocode ONLY when map settles (idle) after user drag
+        marker.addListener("dragstart", () => {
+          if (geocodeDebounceRef.current) {
+            clearTimeout(geocodeDebounceRef.current);
+            geocodeDebounceRef.current = null;
+          }
+        });
+
+        // Fire ONLY on idle after user drag settles (600ms reverse-geocode debounce + local cache)
         map.addListener("idle", () => {
           if (isProgrammaticMoveRef.current) {
             isProgrammaticMoveRef.current = false;
@@ -113,7 +183,6 @@ export function GoogleMapPicker({
           emitCoordinates(newLat, newLng);
         });
 
-        // Marker dragend fires once on release — zero React state work mid-drag
         marker.addListener("dragend", (event: any) => {
           const pos = event?.latLng;
           if (!pos) return;
@@ -124,7 +193,6 @@ export function GoogleMapPicker({
           emitCoordinates(newLat, newLng);
         });
 
-        // Tap / Click anywhere on map to place pin immediately
         map.addListener("click", (event: any) => {
           const pos = event?.latLng;
           if (!pos) return;
@@ -145,9 +213,8 @@ export function GoogleMapPicker({
 
     return () => {
       isMounted = false;
-      if (markerRef.current) {
-        markerRef.current.setMap(null);
-      }
+      if (geocodeDebounceRef.current) clearTimeout(geocodeDebounceRef.current);
+      if (markerRef.current) markerRef.current.setMap(null);
       if (mapInstanceRef.current && window.google?.maps?.event) {
         window.google.maps.event.clearInstanceListeners(mapInstanceRef.current);
       }
@@ -155,7 +222,6 @@ export function GoogleMapPicker({
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [memoizedMapOptions]);
 
-  // Move marker + pan ONLY when coordinates change externally (e.g., Search result or GPS button)
   useEffect(() => {
     const map = mapInstanceRef.current;
     const marker = markerRef.current;
@@ -193,16 +259,14 @@ export function GoogleMapPicker({
         }
         emitCoordinates(curLat, curLng);
       },
-      () => {
-        // Ignore denied geolocation gracefully
-      },
+      () => {},
       { enableHighAccuracy: true, timeout: 8000 }
     );
   };
 
   if (mapError) {
     return (
-      <div className="h-[320px] rounded-2xl border border-slate-200 dark:border-slate-700 bg-slate-50 dark:bg-slate-900 flex flex-col items-center justify-center p-6 text-center text-xs text-slate-500 dark:text-slate-400">
+      <div className="h-[300px] rounded-2xl border border-slate-200 dark:border-slate-700 bg-slate-50 dark:bg-slate-900 flex flex-col items-center justify-center p-6 text-center text-xs text-slate-500 dark:text-slate-400">
         <MapPin className="w-8 h-8 text-slate-400 mb-2" />
         <p className="font-bold text-slate-700 dark:text-slate-200">{mapError}</p>
         <p className="mt-1">Check NEXT_PUBLIC_GOOGLE_MAPS_API_KEY in environment configuration.</p>
@@ -211,7 +275,7 @@ export function GoogleMapPicker({
   }
 
   return (
-    <div className="relative h-[320px] sm:h-[360px] w-full rounded-2xl overflow-hidden border border-slate-200 dark:border-slate-700 bg-slate-100 dark:bg-slate-900">
+    <div className="relative h-[300px] sm:h-[340px] w-full rounded-2xl overflow-hidden border border-slate-200 dark:border-slate-700 bg-slate-100 dark:bg-slate-900">
       <div ref={mapContainerRef} className="w-full h-full" />
 
       {!isLoaded && (
@@ -220,12 +284,10 @@ export function GoogleMapPicker({
         </div>
       )}
 
-      {/* Coordinates overlay pill */}
       <div className="absolute bottom-3 left-3 bg-white/95 dark:bg-slate-900/95 backdrop-blur-xs px-3 py-1.5 rounded-xl border border-slate-200 dark:border-slate-700 shadow-sm text-[11px] font-mono text-slate-700 dark:text-slate-200 pointer-events-none">
         {displayCoord.lat.toFixed(5)}, {displayCoord.lng.toFixed(5)}
       </div>
 
-      {/* GPS Center Button */}
       <button
         type="button"
         onClick={handleUseMyLocation}

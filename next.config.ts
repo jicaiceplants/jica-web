@@ -1,7 +1,10 @@
 import type { NextConfig } from "next";
 
 const nextConfig: NextConfig = {
-  /* config options here */
+  // Vercel Hobby Free-Tier Protection: never consume paid Next.js Image Optimization quota
+  images: {
+    unoptimized: true
+  }
 };
 
 export default nextConfig;
